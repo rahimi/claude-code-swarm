@@ -100,10 +100,17 @@ One project, a handful of runs: treat these as data points.
 
 One session: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 claude --plugin-dir <path to this directory>`.
 
-Permanently (Claude Code 2.1.287+), in a session:
+Permanently (Claude Code 2.1.287+), from your terminal:
 
 ```
-/plugin install agent-swarm --marketplace rahimi/claude-code-swarm
+claude plugin install agent-swarm --marketplace rahimi/claude-code-swarm
+```
+
+or inside Claude Code:
+
+```
+/plugin marketplace add rahimi/claude-code-swarm
+/plugin install agent-swarm@claude-code-swarm
 ```
 
 Look B's rich sky uses `python3` with numpy for smooth motion; without them it falls back to a still PNG sky (`/swarm status` says which). Nothing else needs Python.
