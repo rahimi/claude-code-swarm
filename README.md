@@ -1,7 +1,3 @@
-
-
-https://github.com/user-attachments/assets/05a3fee8-e468-4fd7-bd37-71c663888574
-
 # swarm
 
 A Claude Code mod plus a skill for leading a self-organising **agent team**: teammates message each
