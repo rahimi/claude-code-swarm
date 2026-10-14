@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/05a3fee8-e468-4fd7-bd37-71c663888574
+
 # swarm
 
 A Claude Code mod plus a skill for leading a self-organising **agent team**: teammates message each
@@ -55,7 +59,7 @@ the final synthesis. Load it before you spawn the team, e.g.
 
 ## For humans
 
-<!-- film -->
+https://github.com/user-attachments/assets/6c096b84-152b-4982-863a-38c02b2a3531
 
 ### The pane
 
