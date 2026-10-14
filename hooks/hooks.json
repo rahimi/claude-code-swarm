@@ -1,0 +1,4 @@
+{
+  "description": "swarm hooks module",
+  "modules": ["./register.ts"]
+}

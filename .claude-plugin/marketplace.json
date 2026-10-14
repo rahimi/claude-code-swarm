@@ -1,0 +1,15 @@
+{
+  "name": "claude-code-swarm",
+  "owner": {
+    "name": "rahimi"
+  },
+  "description": "Single-plugin marketplace for agent-swarm, a Claude Code mod and skill for self-organising agent-team swarms",
+  "plugins": [
+    {
+      "name": "agent-swarm",
+      "source": ".",
+      "description": "Agent-team swarm: message log, roster, /swarm pane, lead wake modes, and the swarm protocol skill",
+      "version": "0.2.0"
+    }
+  ]
+}

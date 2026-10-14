@@ -1,0 +1,17 @@
+{
+  "name": "agent-swarm",
+  "version": "0.2.0",
+  "description": "Agent-team swarm: message log, roster, /swarm pane, lead wake modes, and the swarm protocol skill",
+  "author": {
+    "name": "rahimi"
+  },
+  "license": "MIT",
+  "userConfig": {
+    "skyMaxDrawMs": {
+      "type": "number",
+      "title": "Fallback sky draw limit (ms)",
+      "default": 50,
+      "description": "Longest one fallback PNG star map may take to draw before look B turns basic for the session; 0 turns it basic at the first one."
+    }
+  }
+}
