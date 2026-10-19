@@ -29,6 +29,7 @@ import {
   workflowRunOf,
   isWaitDue,
   isHeldFromLead,
+  releaseOf,
   stampLine,
   unstamped,
   waitPathOf,
@@ -43,8 +44,13 @@ import {
   namesText,
   openTaskCount,
   typeOf,
+  nudgeText,
 } from '../hooks/core'
 import { isTeammateName } from '../hooks/replay'
+import { setZone } from './zone'
+
+// The fixtures' times read as UTC: the pane's clock is local time, set here to UTC.
+setZone(0)
 
 const T0 = 1_000_000
 
@@ -247,7 +253,7 @@ describe('wake policy', () => {
 })
 
 describe('stall watchdog', () => {
-  const base = { now: T0 + 6 * 60_000, lastActivityAt: T0, stallMs: 5 * 60_000, activeAgents: 0, liveAgents: 2, openTasks: 3, leadBusy: false, alreadyFired: false }
+  const base = { now: T0 + 6 * 60_000, lastActivityAt: T0, stallMs: 5 * 60_000, activeAgents: 0, liveAgents: 2, openTasks: 3, openClaims: 0, leadBusy: false, alreadyFired: false }
 
   test('fires when quiet, nobody running and tasks remain', () => {
     expect(isStalled(base)).toBe(true)
@@ -261,6 +267,11 @@ describe('stall watchdog', () => {
     expect(isStalled({ ...base, alreadyFired: true })).toBe(false)
     expect(isStalled({ ...base, openTasks: null })).toBe(true)
     expect(isStalled({ ...base, openTasks: null, liveAgents: 0 })).toBe(false)
+  })
+
+  test('an open claim is work remaining though the task list is empty (run 3: no tasks, the pane showed the holder stalled)', () => {
+    expect(isStalled({ ...base, openTasks: 0, openClaims: 1 })).toBe(true)
+    expect(isStalled({ ...base, openTasks: 0, openClaims: 1, activeAgents: 1 })).toBe(false)
   })
 
   test('task files count as open unless completed', () => {
@@ -292,10 +303,56 @@ describe('pane text', () => {
 })
 
 describe('claims', () => {
+  test('a claim target that starts with a path is the path alone; only [RELEASE]/[WITHDRAW] <target>, a first clause "[<name>:] I release|withdraw|drop my claim on <target>", "I drop my <target> claim", "Yielding <target> to", a sentence "The <target> claim is released to", or "[CLAIM] <target> is withdrawn" (no claim) releases', () => {
+    expect(claimOf('[CLAIM] research architecture/05-enrichment-and-capture.md (h14). Output: swarm-haiku/h14-05.md')).toEqual({ role: 'research', target: 'architecture/05-enrichment-and-capture.md' })
+    const ordinary = [
+      'I handed the draft of x.ts to h04 for review',
+      'vendor released v2 of x.ts yesterday',
+      '[REVIEW] withdrawn finding #3 on x.ts',
+      '[CLAIM] build x.ts — released lock issue fixed',
+      'commit lock released on x.ts',
+      'Note: we both used the name Basalt; I drop it. [CLAIM] research x.ts',
+      'I release the mutex in x.ts so you can run the tests',
+      'I withdraw my objection, x.ts looks fine',
+      'x.ts is released to review',
+      'h11: I am withdrawing my [REVIEW] request for x.ts.',
+      'h06: Withdraw from that review on x.ts if you are busy',
+    ]
+    for (const t of ordinary) {
+      expect(releaseOf(t)).toBeUndefined()
+      const b = new ClaimBoard()
+      b.claim('h1', { role: 'build', target: 'x.ts' })
+      const own = claimOf(t)
+      if (own !== undefined) b.claim('h1', own)
+      expect(b.release('h1', t)).toBe(false)
+      expect(b.all().some(c => c.target === 'x.ts' && c.by.includes('h1'))).toBe(true)
+    }
+    expect(claimOf('[CLAIM] build x.ts — released lock issue fixed')).toEqual({ role: 'build', target: 'x.ts' })
+    const b = new ClaimBoard()
+    for (const [by, t] of [['h03', 'docs/user/03-accounts.md'], ['h03', 'docs/user/admin-4.md'], ['h04', 'docs/user/03-accounts.md'], ['h10', 'docs/architecture/06-web-app.md'], ['h05', 'docs/c.md'], ['h06', 'docs/d.md'], ['h07', 'docs/user/07-profil.md'], ['h14', 'docs/architecture/05-enrichment-and-capture.md'], ['h09', 'docs/user/09-x.md']] as const) b.claim(by, { role: 'research', target: t })
+    b.claim('h06', { role: 'build', target: 'docs/d.md' })
+    expect(b.release('h03', '[RELEASE] docs/user/03-accounts.md, h04 keeps it')).toBe(true)
+    expect(b.release('h10', '[WITHDRAW] 06-web-app (h08 first)')).toBe(true)
+    expect(b.release('h05', 'I release docs/c.md. h02 takes it.')).toBe(true)
+    expect(b.release('h06', 'I drop my claim on docs/d.md')).toBe(true)
+    expect(b.release('h04', '[WITHDRAW] docs/user/admin-4.md')).toBe(false)
+    expect(b.release('h07', 'Yielding 07 to you: your claim came first by stamp.')).toBe(true)
+    expect(b.release('h14', 'h14: I drop my 05-enrichment-and-capture claim (h13 claimed first at 18:03:14).')).toBe(true)
+    expect(b.release('h09', '[CLAIM] research docs/user/admin-4.md (h09). The 09 claim is released to h04.')).toBe(true)
+    const handedOver = '[CLAIM] research docs/user/07-profil-erfassen.md is withdrawn: I drop it, you keep it (the lead confirmed your first claim). The file swarm-haiku/basalt-07-pro…'
+    expect(claimOf(handedOver)).toBeUndefined()
+    b.claim('h08', { role: 'research', target: 'docs/user/07-profil-erfassen.md' })
+    expect(b.release('h08', handedOver)).toBe(true)
+    expect(b.all().map(c => [c.key, c.by])).toEqual([['research docs/user/03-accounts.md', ['h04']], ['research docs/user/admin-4.md', ['h03']]])
+    b.addDeliverables(['docs/user/03-accounts.md', 'docs/user/05-offen.md', 'docs/user/08-diktat.md', 'docs/user/09-x.md', 'docs/user/10-y.md'])
+    expect(b.unclaimed().slice(0, 3)).toEqual(['docs/user/05-offen.md', 'docs/user/08-diktat.md', 'docs/user/09-x.md'])
+  })
   test('claimOf reads role and target from the first line', () => {
     expect(claimOf('[CLAIM] build var/swarm-test/gaps.md\nbody')).toEqual({ role: 'build', target: 'var/swarm-test/gaps.md' })
     expect(claimOf('[claim] Builder of `gaps.md`.')).toEqual({ role: 'build', target: 'gaps.md' })
-    expect(claimOf('[CLAIM] research group A (capture-*)')).toEqual({ role: 'research', target: 'group a (capture-*)' })
+    expect(claimOf('[CLAIM] research group A (capture-*)')).toEqual({ role: 'research', target: 'group' })
+    expect([claimOf('[CLAIM] research "group A" (capture-*)'), claimOf('[CLAIM] research `group B`')]).toEqual([{ role: 'research', target: 'group a' }, { role: 'research', target: 'group b' }])
+    expect(sameTarget('group a', 'group b')).toBe(false)
     expect(claimOf('[CLAIM] the parser')).toBeUndefined()
     expect(claimOf('Slice: [CLAIM] came first, so w2 takes another slice')).toBeUndefined()
     expect(claimOf('[CLAIM] Review #7')).toEqual({ role: 'review', target: '#7' })
@@ -307,9 +364,84 @@ describe('claims', () => {
     expect(claimOf('[CLAIM] build out/findings.md" before your claim')).toBeUndefined()
     expect(claimOf('[CLAIM] please take the parser')).toBeUndefined()
     expect(claimOf('[CLAIM] build "docs/x.md"')).toEqual({ role: 'build', target: 'docs/x.md' })
-    expect(claimOf('[CLAIM] build docs/x.md, reviewers please hold')).toEqual({ role: 'build', target: 'docs/x.md, reviewers please hold' })
-    expect(claimOf('[CLAIM] build (docs/x.md)')).toEqual({ role: 'build', target: '(docs/x.md)' })
-    expect(claimOf('[CLAIM] build #155 (hydration fix)')).toEqual({ role: 'build', target: '#155 (hydration fix)' })
+    expect(claimOf('[CLAIM] build docs/x.md, reviewers please hold')).toEqual({ role: 'build', target: 'docs/x.md' })
+    expect(claimOf('[CLAIM] build (docs/x.md)')).toEqual({ role: 'build', target: 'docs/x.md' })
+    expect(claimOf('[CLAIM] build #155 (hydration fix)')).toEqual({ role: 'build', target: '#155' })
+  })
+
+  test('a claim target is its target token: trailing prose never joins it (10-17 log l.11, l.20, l.330, l.969, l.1593)', () => {
+    const u1 = claimOf('[CLAIM] research core-aa (u1, sonnet)')
+    const u2 = claimOf('[CLAIM] research core-aa (u2, code name Ivy)')
+    expect([u1, u2]).toEqual([{ role: 'research', target: 'core-aa' }, { role: 'research', target: 'core-aa' }])
+    expect(claimOf('[CLAIM] research int-ai (u16, Lark, haiku). Starting now.')).toEqual({ role: 'research', target: 'int-ai' })
+    const prose = 'int-aa is mine: my [CLAIM] research int-aa is #29 (08:56:25), yours is #39, and the lead confirmed it to me. Please take another free slice (not int-aa).'
+    expect(claimOf(prose)).toBeUndefined()
+    expect(claimOf('[CLAIM] research researchAgent.test.ts (gap-fill for int-ai). Per lead: I take researchAgent.test.ts in full')).toEqual({ role: 'research', target: 'researchagent.test.ts' })
+    const b = new ClaimBoard()
+    b.claim('u1', u1!, true, { stamp: 1 })
+    b.claim('u2', u2!, true, { stamp: 4 })
+    expect(b.all().map(c => [c.key, c.by])).toEqual([['research core-aa', ['u1', 'u2']]])
+    expect(b.heldBefore('u2', u2!)).toMatchObject({ holder: 'u1', stamp: 1 })
+  })
+
+  test('a later [CLAIM] counts unless it is quoted or follows a possessive or a word that reports another claim (run-2 l.1722, l.738; older log l.3317, l.374, l.1506, l.2722)', () => {
+    expect(claimOf('[ASK] findings.md builder is r3 Lanz — they sent [CLAIM] build /work/swarm-review/findings.md earlier; please don\'t claim it.')).toBeUndefined()
+    expect(claimOf('Stamps show my claim came first: my [CLAIM] research docs/user/03-accounts-und-briefs.md went out at #59–#61 (17:52:21)')).toBeUndefined()
+    for (const t of ['[PROPOSE] hello Quill — [CLAIM] research web-af', '[PROPOSE] hello Quill (sonnet) [CLAIM] research web-af', '**[CLAIM] research web-af**', '| [CLAIM] research web-af |', 'Quill here and [CLAIM] research web-af']) {
+      expect(claimOf(t)).toEqual({ role: 'research', target: 'web-af' })
+    }
+    expect(claimOf('[CLAIM] review hooks/*.ts')).toEqual({ role: 'review', target: 'hooks/*.ts' })
+    expect(claimOf("int-ai is taken: v18's [CLAIM] research int-ai (#349, 12:17:12) came before yours (#382). Findings are already written to out/v18-int-ai.md and are with v8 for…")).toBeUndefined()
+    expect(claimOf('[ASK] music.md: please confirm [CLAIM] build music.md. Spec from design.md: 172 BPM')).toBeUndefined()
+    expect(claimOf('web-ac is claimed by v8 first: "[RELEASE] web-ab ... [CLAIM] research web-ac" (log ts 1792231922782)')).toBeUndefined()
+    expect(claimOf('[RELEASE] web-ab (Mote/v8). [CLAIM] research web-ac')).toEqual({ role: 'research', target: 'web-ac' })
+    expect(claimOf('[PROPOSE] hello Granit (h08, Haiku 5.5). Strengths: code-to-doc claim checks, UI string tracing. [CLAIM] research docs/architecture/06-web-app.md. Output: swar…')).toEqual({ role: 'research', target: 'docs/architecture/06-web-app.md' })
+    expect(claimOf('[PROPOSE] hello Quill, [CLAIM] research web-af')).toEqual({ role: 'research', target: 'web-af' })
+    expect(claimOf('[PROPOSE] hello Juniper\nHaiku, read-only audit.\n[CLAIM] research web-af')).toEqual({ role: 'research', target: 'web-af' })
+  })
+
+  test('a release names every own claim its text names before its first sentence end or [CLAIM] (older-log [WITHDRAW] lines; run-2 l.738)', () => {
+    const b = new ClaimBoard()
+    const own = (by: string, ...targets: string[]) => { for (const t of targets) b.claim(by, { role: 'research', target: t }) }
+    own('h10', 'docs/architecture/06-web-app.md', 'docs/architecture/04-ingest.md')
+    own('v13', 'web-ab', 'web-ac', 'web-ad')
+    own('v8', 'web-ab', 'web-ac')
+    expect(b.release('h10', '[WITHDRAW] h10 withdraws the 06-web-app claim (h08 first).')).toBe(true)
+    expect(b.release('h10', '[WITHDRAW] h10 withdraws its 04-ingest claim')).toBe(true)
+    expect(b.release('v13', '[RELEASE] web-ab, web-ac')).toBe(true)
+    expect(b.release('v13', '[RELEASE] my web-ad claim')).toBe(true)
+    own('v13', 'web-ac')
+    expect(b.release('v13', '[RELEASE] v13 releases web-ac')).toBe(true)
+    expect(b.release('v8', '[RELEASE] web-ab (Mote/v8). [CLAIM] research web-ac')).toBe(true)
+    expect(b.all().map(c => [c.key, c.by])).toEqual([['research web-ac', ['v8']]])
+  })
+
+  test('the mod\'s own [ASK] keeps its type behind the swarm: prefix; the stall nudge reads swarm: [ASK] quiet', () => {
+    expect(typeOf('swarm: [ASK] web-ac is already claimed by v8 (v8, since 12:12:02, #164). Talk to them, split it, or pick another slice.')).toBe('ASK')
+    expect(nudgeText(5, [{ role: 'build', target: 'x.md', key: 'build x.md', by: ['t1'] }], new Map(), n => n)).toBe('[ASK] quiet 5 min: you hold build x.md; nobody has reported. Continue, or send [DONE]/[BLOCK].')
+  })
+
+  test('a first line [CLAIM] <target> is (already) taken|held, is already claimed or claimed|held|taken by … reports who holds it and is no claim, also when an older log stored one; is mine now and is claimed: starting are claims (run 3 l.229, l.457, l.506, l.713, l.977, l.1230; l.234)', () => {
+    const reports = [
+      "[CLAIM] research arch-06-web-app is already taken: Lantern (w6) claimed it at #47, before your #52. Pick another slice; I have no claim on it either.",
+      "[CLAIM] research arch-06-web-app is mine: the lead confirmed it (\"swarm: research arch-06-web-app is yours\", 13:12). Please pick another slice, e.g. user-01-er…",
+      "[CLAIM] research user-02-heute-und-anlaesse is already taken: Halyard (w10) claimed it at #79, before your #88. Pick another slice.",
+      "[CLAIM] research user-03-accounts-und-briefs is already taken: w1 claimed it at #106, before your #116. Pick another slice.",
+      "[CLAIM] research user-06-assistent is already taken: w11 claimed it at #148, before your #160. Pick another slice.",
+      "[CLAIM] research user-09-dokumente-und-wissen is already taken: w15 claimed it at #219, before your #234. Pick another slice.",
+      "[CLAIM] research user-admin-3-budgets-und-credits is already taken: w17 claimed it at #302, before your #319. Pick another slice.",
+    ]
+    const lantern = reports.splice(1, 1)[0]!
+    for (const t of reports) expect(claimOf(t)).toBeUndefined()
+    for (const t of ['[CLAIM] research x is held by w2', '[CLAIM] build docs/a.md is claimed by w1', '[CLAIM] research x taken by w4']) expect(claimOf(t)).toBeUndefined()
+    expect(claimOf(lantern)).toEqual({ role: 'research', target: 'arch-06-web-app' })
+    expect(claimOf('[CLAIM] build docs/x.md is mine now, starting')).toEqual({ role: 'build', target: 'docs/x.md' })
+    expect(claimOf('[CLAIM] research web-ab is claimed: starting now')).toEqual({ role: 'research', target: 'web-ab' })
+    expect(claimOf('[CLAIM] research arch-06-web-app (Lantern, w6)')).toEqual({ role: 'research', target: 'arch-06-web-app' })
+    const line = (from: string, summary: string) => ({ ts: T0, from, to: 'w1', summary, length: 1, via: 'send' as const, session: 's', claim: { role: 'research', target: 'arch-06-web-app' } })
+    const b = new ClaimBoard()
+    hydrateClaims(b, [line('w6', '[CLAIM] research arch-06-web-app (Lantern, w6)'), line('w3', reports[0]!), line('w6', lantern)], 's')
+    expect(b.all().map(c => [c.key, c.by])).toEqual([['research arch-06-web-app', ['w6']]])
   })
 
   test('a file tool call shows as a mark and the path from the working directory', () => {
@@ -338,7 +470,7 @@ describe('claims', () => {
 
   test('board: duplicates, missing builders, task owners and unclaimed tasks', () => {
     const b = new ClaimBoard()
-    expect(b.missingBuilders()).toEqual(['the deliverable'])
+    expect(b.missingBuilders()).toEqual([])
     b.addDeliverables(['var/gaps.md'])
     expect(b.missingBuilders()).toEqual(['var/gaps.md'])
     expect(b.claim('t3', { role: 'research', target: 'group a' })).toBe(true)
@@ -437,6 +569,12 @@ describe('roster display', () => {
     expect(renameName("[REVIEW] #155 ack — ridge reviews #155; I told kite to stay on #141 and I'll review #141 instead.")).toBeUndefined()
     expect(renameName('[REVIEW] request #155 — rotation confirmed: kite reviews #155')).toBeUndefined()
     expect(renameName('I am idle, I am not blocked')).toBeUndefined()
+    expect(renameName('Note: g3 renames to vireo.')).toBeUndefined()
+    expect(renameName("I'm reviewing from now on")).toBeUndefined()
+    expect(renameName("clash with d1, I'm heron from now on")).toBe('heron')
+    expect(renameName('I rename to "sedge"')).toBe('sedge')
+    expect(renameName('I work from now on in the worktree')).toBeUndefined()
+    expect(renameName('[HANDOFF] slice done\n- claim: prompts/tools/brief/ingest_document.md no longer says "of its account" (now true).')).toBeUndefined()
   })
 
   test('a later message renames; a late delivery of an old hello does not revert it; duplicates are flagged with casing kept', () => {
@@ -472,6 +610,13 @@ describe('roster display', () => {
     expect(reloaded.idle.get('t1')).toMatchObject({ count: 5, lastAt: T0 + 4000 })
   })
 
+  test('a reload restores no JOIN or LEFT line as a message', () => {
+    const log = new MessageLog()
+    const move = (type: string, ts: number) => ({ ts, from: 't1', to: '', summary: type === 'JOIN' ? 'joined' : 'completed', length: 0, via: 'tool' as const, type, session: 'session-x' })
+    hydrateLog(log, new Roster(), [move('JOIN', T0), move('LEFT', T0 + 1000)], 'session-x')
+    expect([log.entries.length, log.earlier.length]).toEqual([0, 0])
+  })
+
   test('agents outside the current team, ended, or pending over 10 min, show dimmed under other agents after the active teammates', () => {
     const r = new Roster()
     r.spawned({ name: 'integrate', model: 'claude-opus-5-5[1m]', subagentType: 'workflow-subagent' }, { agentId: 'w1' }, T0)
@@ -490,6 +635,21 @@ describe('roster display', () => {
     const late = names(at(T0 + 11 * 60_000))
     expect(late.active).toEqual(['team-lead', 't1'])
     expect(late.other.map(o => o[0])).toEqual(['workflow', 'delta:report-export-tim…', 't2', 't3', 't4'])
+  })
+
+  test('a running subagent a teammate spawned shows right under that teammate; once ended, under other agents', () => {
+    const r = new Roster()
+    for (const n of ['t1', 't2']) r.spawned({ name: n, isTeammate: true }, { agentId: 'a' + n, teammateId: n + '@session-6036d038' }, T0)
+    r.spawned({ description: 'scan the repo', subagentType: 'Explore', parentAgentId: 'at1' }, { agentId: 'a5c0ffee00000001' }, T0)
+    r.merge([{ id: 'a5c0ffee00000001', type: 'Explore', status: 'running', description: 'scan the repo' }, { id: 'abeef00000000002', type: 'Explore', status: 'running', description: 'read the docs', parentId: 'at2' }], T0 + 1000)
+    const text = (now: number) => paneRows(r, new MessageLog(), new WakePolicy(), now, 80, 10).map(x => x.text)
+    const live = text(T0 + 2000)
+    expect(live.slice(4, 8).map(l => l.trim().slice(0, 18))).toEqual(['◌ t1', '└ ● scan the repo', '◌ t2', '└ ● read the docs'].map(l => l.padEnd(18)))
+    expect(live).not.toContain(OTHER_AGENTS)
+    r.merge([{ id: 'a5c0ffee00000001', type: 'Explore', status: 'completed', description: 'scan the repo' }, { id: 'abeef00000000002', type: 'Explore', status: 'running', description: 'read the docs', parentId: 'at2' }], T0 + 3000)
+    const after = text(T0 + 4000)
+    expect(after.filter(l => l.includes('└')).map(l => l.trim().slice(0, 17))).toEqual(['└ ● read the docs'])
+    expect(after.slice(after.indexOf(OTHER_AGENTS) + 1).some(l => l.includes('scan the repo'))).toBe(true)
   })
 
   test('messages run newest first; a previous session follows under earlier at the bottom', () => {
@@ -520,7 +680,7 @@ describe('claim watchdog timing and live claims', () => {
   test('the live claims cover the live deliverables', () => {
     const hello = '[PROPOSE] hello ridge\nOpus. Strengths: frontend layout/geometry math, test pins.\nSlice wanted: [CLAIM] build #158 (chart label fit). Suggest t2 -> #155, t3 -> #141'
     expect(claimOf(hello)).toMatchObject({ role: 'build' })
-    expect(claimOf(hello)?.target.startsWith('#158 (chart label fit)')).toBe(true)
+    expect(claimOf(hello)?.target).toBe('#158')
     expect(targetMatches('#155 (cache bug #418 on /search). kestrel', 'repo#155')).toBe(true)
     expect(targetMatches('#141', 'repo#141')).toBe(true)
     expect(targetMatches('#14', 'repo#141')).toBe(false)
@@ -617,6 +777,17 @@ describe('workflow agents', () => {
     expect(r.agents.get('a3cd381eed610c950')?.status).toBe('completed')
   })
 
+  test('a reload: a restored teammate the agent list never reports again has ended (builder-mod stayed idle)', () => {
+    const r = new Roster()
+    r.hydrate({ session: 's', agents: [
+      { id: 'builder-mod', name: 'builder-mod', type: 'teammate', status: 'idle', isTeammate: true, teammateId: 'builder-mod@team', spawnedAt: T0, statusAt: T0 },
+      { id: 'h1', name: 'h1', type: 'teammate', status: 'idle', isTeammate: true, teammateId: 'h1@team', spawnedAt: T0, statusAt: T0 },
+    ] }, 's', T0 + 1000)
+    r.merge([{ id: 'h1', name: 'h1', type: 'teammate', status: 'idle', teammateId: 'h1@team', description: '' }], T0 + 2000)
+    expect(r.agents.get('builder-mod')?.status).toBe('completed')
+    expect(r.agents.get('h1')?.status).toBe('idle')
+  })
+
   test('the Workflow call gives the run id and name, from its result or its input', () => {
     const result = { status: 'async_launched', taskId: 'w3i23hrkc', taskType: 'local_workflow', workflowName: 'dev-team', runId: RUN }
     expect(workflowRunOf({ name: 'dev-team', args: { title: 'bench B' } }, result)).toEqual({ runId: RUN, name: 'dev-team' })
@@ -707,6 +878,30 @@ describe('pane: current team', () => {
     expect(lines[0]).toMatch(/^swarm: 2 agents ·/)
     expect(lines.indexOf(OTHER_AGENTS)).toBeLessThan(lines.findIndex(l => l.includes(' t3 ')))
     expect(lines.indexOf(OTHER_AGENTS)).toBeGreaterThan(lines.findIndex(l => l.includes(' t2 ')))
+  })
+
+  test('a teammate idle for over 6 h is dormant, shown as ended (under other agents, not counted) but still live for the team; busy again, holding a wait or claim, or a message since, it is not', () => {
+    const r = team()
+    const H = 3_600_000
+    const at = (now: number, statuses: Record<string, string>) =>
+      r.merge(Object.entries(statuses).map(([n, status]) => ({ id: 'a' + n, name: n, type: 'teammate', status, teammateId: n + '@session-6036d038', description: '' })), now)
+    at(T0 + 500, { t1: 'running', t2: 'idle', t3: 'idle' })
+    at(T0 + 5 * H, { t1: 'running', t2: 'idle', t3: 'idle' })
+    const dormant = () => ['t1', 't2', 't3'].map(n => r.isDormant(r.agents.get('a' + n)!))
+    expect(dormant()).toEqual([false, false, false])
+    r.noteMessage('t3', T0 + 2 * H)
+    at(T0 + 6 * H + 1000, { t1: 'running', t2: 'idle', t3: 'idle' })
+    expect(dormant()).toEqual([false, true, false])
+    expect([r.isLiveTeammate('t2'), r.liveCount(), r.isTeamEnded()]).toEqual([true, 3, false])
+    const lines = paneLines(r, new MessageLog(), new WakePolicy(), T0 + 6 * H + 1000, 100, 5)
+    expect(lines[0]).toMatch(/^swarm: 2 agents ·/)
+    expect(lines.indexOf(OTHER_AGENTS)).toBeGreaterThan(lines.findIndex(l => l.includes(' t3 ')))
+    expect(lines.indexOf(OTHER_AGENTS)).toBeLessThan(lines.findIndex(l => l.includes(' t2 ')))
+    r.isHeld = n => n === 't2'
+    expect(dormant()).toEqual([false, false, false])
+    r.isHeld = () => false
+    at(T0 + 6 * H + 3000, { t1: 'running', t2: 'running', t3: 'idle' })
+    expect(dormant()).toEqual([false, false, false])
   })
 
   test('a teammate whose hello keeps its placeholder shows (no code name)', () => {
@@ -806,7 +1001,7 @@ describe('claim conflicts', () => {
 })
 
 describe('claim conflicts: inactive holders', () => {
-  test('a holder that ended or reported [DONE] or [REVIEW] after its claim holds nothing: the next claimant gets no holder and no ⚠; a [BLOCK] keeps it', () => {
+  test('a holder that ended or reported [DONE] on its claim holds nothing: the next claimant gets no holder and no ⚠; a [REVIEW] keeps a research claim, a [BLOCK] a build claim', () => {
     const b = new ClaimBoard()
     const ended = new Set(['t5'])
     b.isLive = n => !ended.has(n)
@@ -815,8 +1010,10 @@ describe('claim conflicts: inactive holders', () => {
     b.claim('t2', { role: 'build', target: 'x.md' }, true, { stamp: 2 })
     expect(b.heldBefore('t2', { role: 'build', target: 'x.md' })).toBeUndefined()
     b.claim('t3', { role: 'research', target: 'y.md' }, true, { stamp: 3 })
-    b.report('t3', 'REVIEW')
+    b.report('t3', 'REVIEW', true, '[REVIEW] #7 approve')
     b.claim('t4', { role: 'research', target: 'y.md' }, true, { stamp: 4 })
+    expect(b.heldBefore('t4', { role: 'research', target: 'y.md' })?.holder).toBe('t3')
+    b.report('t3', 'DONE', true, '[DONE] y.md')
     expect(b.heldBefore('t4', { role: 'research', target: 'y.md' })).toBeUndefined()
     b.claim('t5', { role: 'build', target: 'z.md' }, true, { stamp: 5 })
     b.claim('t6', { role: 'build', target: 'z.md' }, true, { stamp: 6 })
@@ -828,6 +1025,78 @@ describe('claim conflicts: inactive holders', () => {
     b.claim('t8', { role: 'build', target: 'w.md' }, true, { stamp: 8 })
     expect(b.heldBefore('t8', { role: 'build', target: 'w.md' })?.holder).toBe('t7')
     expect(claimLines(b, n => n)).toContain('w.md · build t7, t8 ⚠ duplicate')
+  })
+
+  test('a report closes claims per slice: a [DONE] naming one slice leaves the holder\'s other claims open, a [REVIEW] closes the review claims only, a [BLOCK] none, a [DONE] naming none all', () => {
+    const b = new ClaimBoard()
+    b.claim('t1', { role: 'build', target: 'x.md' }, true, { stamp: 1 })
+    b.claim('t1', { role: 'build', target: 'y.md' }, true, { stamp: 2 })
+    b.claim('t1', { role: 'review', target: 'z.md' }, true, { stamp: 3 })
+    b.report('t1', 'REVIEW', true, '[REVIEW] z.md approve\nmeasured: x.md and y.md untouched')
+    expect(b.openClaims('t1').map(c => c.key)).toEqual(['build x.md', 'build y.md'])
+    b.claim('t1', { role: 'review', target: 'w.md' }, true, { stamp: 4 })
+    b.report('t1', 'REVIEW', true, '[REVIEW] x.md pin added at 7aa34b1, see the handoff thread')
+    b.report('t1', 'DONE', true, '[DONE] x.md\nshipped; y.md next')
+    expect(b.openClaims('t1').map(c => c.key)).toEqual(['build y.md', 'review w.md'])
+    b.claim('t2', { role: 'build', target: 'y.md' }, true, { stamp: 4 })
+    expect(b.heldBefore('t2', { role: 'build', target: 'y.md' })?.holder).toBe('t1')
+    b.claim('t3', { role: 'build', target: 'x.md' }, true, { stamp: 5 })
+    expect(b.heldBefore('t3', { role: 'build', target: 'x.md' })).toBeUndefined()
+    b.report('t1', 'BLOCK', true, '[BLOCK] y.md tests red')
+    expect(b.openClaims('t1').map(c => c.key)).toEqual(['build y.md', 'review w.md'])
+    b.report('t1', 'DONE', true, '[DONE] all shipped')
+    expect(b.openClaims('t1')).toEqual([])
+  })
+
+  test('a later claim (one that found a holder) lapses at its sender\'s next claim of another slice or next report, of any type; the first holder keeps its claim', () => {
+    const b = new ClaimBoard()
+    b.claim('t1', { role: 'build', target: 'x.md' }, true, { stamp: 1 })
+    b.claim('t2', { role: 'build', target: 'x.md' }, true, { stamp: 2 })
+    expect(b.duplicates().map(c => c.by)).toEqual([['t1', 't2']])
+    b.claim('t2', { role: 'build', target: 'x.md' }, true, { stamp: 3 })
+    expect(b.openClaims('t2').map(c => c.key)).toEqual(['build x.md'])
+    b.claim('t2', { role: 'build', target: 'y.md' }, true, { stamp: 4 })
+    expect(b.openClaims('t2').map(c => c.key)).toEqual(['build y.md'])
+    expect(b.duplicates()).toEqual([])
+    expect(b.openClaims('t1').map(c => c.key)).toEqual(['build x.md'])
+    b.claim('t3', { role: 'build', target: 'x.md' }, true, { stamp: 5 })
+    b.report('t3', 'BLOCK', true, '[BLOCK] #4 tests red')
+    expect(b.openClaims('t3')).toEqual([])
+    b.claim('t4', { role: 'build', target: 'x.md' }, true, { stamp: 6 })
+    b.report('t4', 'REVIEW', true, '[REVIEW] #4 approve')
+    expect(b.openClaims('t4')).toEqual([])
+    expect(b.heldBefore('t5', { role: 'build', target: 'x.md' })?.holder).toBe('t1')
+    b.release('t1', '[RELEASE] x.md')
+    b.claim('t4', { role: 'build', target: 'x.md' }, true, { stamp: 7 })
+    b.report('t4', 'REVIEW', true, '[REVIEW] #5 approve')
+    expect(b.openClaims('t4').map(c => c.key)).toEqual(['build x.md'])
+    b.claim('t5', { role: 'review', target: 'x.md' }, true, { stamp: 8 })
+    b.claim('t6', { role: 'review', target: 'x.md' }, true, { stamp: 9 })
+    b.claim('t6', { role: 'review', target: 'y.md' }, true, { stamp: 10 })
+    expect(b.openClaims('t6').map(c => c.key)).toEqual(['review y.md'])
+    expect(b.openClaims('t5').map(c => c.key)).toEqual(['review x.md'])
+  })
+
+  test('a live task-list owner holds its task\'s target against a message claimant, unless the claimant owns it too; an ended owner or a completed task holds nothing', () => {
+    const b = new ClaimBoard()
+    const ended = new Set(['t9'])
+    b.isLive = n => !ended.has(n)
+    b.setTasks([
+      { subject: 'build docs/a.md', owner: 't1', status: 'in_progress' },
+      { subject: 'slice-b', owner: 't2', status: 'in_progress' },
+      { subject: 'build c.md', owner: 't9', status: 'in_progress' },
+      { subject: 'build d.md', owner: 't2', status: 'completed' },
+    ], n => n)
+    b.claim('t3', { role: 'build', target: 'a.md' }, true, { stamp: 1 })
+    expect(b.heldBefore('t3', { role: 'build', target: 'a.md' })).toEqual({ key: 'build a.md', target: 'a.md', holder: 't1' })
+    b.claim('t1', { role: 'build', target: 'docs/a.md' }, true, { stamp: 2 })
+    expect(b.heldBefore('t1', { role: 'build', target: 'docs/a.md' })).toBeUndefined()
+    b.claim('t4', { role: 'research', target: 'slice-b' }, true, { stamp: 3 })
+    expect(b.heldBefore('t4', { role: 'research', target: 'slice-b' })?.holder).toBe('t2')
+    b.claim('t5', { role: 'build', target: 'c.md' }, true, { stamp: 4 })
+    expect(b.heldBefore('t5', { role: 'build', target: 'c.md' })).toBeUndefined()
+    b.claim('t6', { role: 'build', target: 'd.md' }, true, { stamp: 5 })
+    expect(b.heldBefore('t6', { role: 'build', target: 'd.md' })).toBeUndefined()
   })
 })
 

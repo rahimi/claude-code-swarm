@@ -8,13 +8,15 @@ import { css } from './grid'
 import { newSidecar, pauseSidecar, quitSidecar, startSidecar, updateSidecar } from './sidecar'
 import type { LogEntry } from './core'
 import { FLASH_MS, PULSE_MS } from './looks'
-import type { Frame, ImageLayer, View } from './looks'
-import { IMAGE_MIN_MS, ImageShelf, LOOK_FNS, agentControls, bandsOf, controlsOf, shapeOf, viewControls } from './pane-draw'
+import type { Frame, View } from './looks'
+import { IMAGE_MIN_MS, ImageShelf, LOOK_FNS, STOP_ALL_KEY, agentControls, bandsOf, controlRows, controlsOf, shapeOf, stopControls, viewControls } from './pane-draw'
 import type { Control } from './pane-draw'
-import { Scene, modelsOf, parseReplayArgs, runTitle, schedule, splitRuns, windowOf } from './replay'
+import { Scene, modelsOf, parseReplayArgs, resolveCodes, runTitle, schedule, splitRuns, windowOf } from './replay'
 import type { Look, Level, ReplayArgs, Run } from './replay'
 
 export const PANE = 'swarm'
+/** The key of the live pane's field that messages the agent it is filtered to. */
+export const COMPOSE_KEY = 'compose'
 /** Real ms between animation frames while a message travels or a change glows. */
 const FRAME_MS = 80
 /** How long after the latest event the animation keeps running. */
@@ -101,6 +103,11 @@ const live: Stage & { view: LiveView; source?: () => LiveSource } = { ...newStag
 
 export function isReplaying(): boolean {
   return replay !== undefined
+}
+
+/** The agent the live pane is filtered to, or undefined. */
+export function liveFilter(): string | undefined {
+  return live.filter
 }
 
 /** Which live view the pane shows: look A (the default), look B, or the text list. */
@@ -275,8 +282,8 @@ async function paintNow($: EngineInterface) {
     for (const p of b.pieces) {
       if (p.kind === 'raster') {
         await $.ui.blit({ requestId: PANE, key: p.key, cells: frame.grid.cells(p.x, b.y, p.cols, b.rows), columns: p.cols, rows: b.rows })
-      } else if (p.layer.stream === undefined || !skyActive()) {
-        const { source, isNew } = takeImage($, s, p.layer, now)
+      } else if (p.layer.stream === undefined) {
+        const { source, isNew } = s.images.take(p.layer, now)
         if (isNew && (await $.ui.blit({ requestId: PANE, key: p.layer.key, source })).deny !== undefined) s.images.forget(p.layer.key)
       }
     }
@@ -301,7 +308,7 @@ export function ownSky($: EngineInterface) {
 
 /**
  * Keeps the sky renderer in step with a frame: started and handed the scene while the frame has a streamed sky, stopped
- * when it has none; once failed, the frame's PNG sky is used.
+ * when it has none.
  */
 async function feedSky($: EngineInterface, frame: Frame, now: number) {
   const layer = frame.images.find(im => im.stream !== undefined)
@@ -318,36 +325,9 @@ async function feedSky($: EngineInterface, frame: Frame, now: number) {
   await updateSidecar($, sky, now, layer.stream!)
 }
 
-/** The longest a PNG sky may take to draw (the `skyMaxDrawMs` option): one slower turns look B basic for the session; 0, the first one does. */
-let skyMaxDrawMs = 50
-
-export function setSkyMaxDrawMs(ms: number) {
-  skyMaxDrawMs = ms
-}
-/** How long the PNG sky took when it was too slow; set, look B draws at the basic level. */
-let slowSkyMs: number | undefined
-
-/** An Image's source from the stage's shelf; a new PNG sky past `skyMaxDrawMs` turns look B basic. */
-function takeImage($: EngineInterface, s: Stage, layer: ImageLayer, now: number) {
-  const t0 = performance.now()
-  const r = s.images.take(layer, now)
-  const ms = performance.now() - t0
-  if (r.isNew && layer.stream !== undefined && (skyMaxDrawMs === 0 || ms > skyMaxDrawMs) && slowSkyMs === undefined) {
-    slowSkyMs = ms
-    $.ui.log(`swarm: the PNG sky took ${Math.round(ms)} ms, look B draws basic`)
-    $.ui.invalidate('ui.render')
-  }
-  return r
-}
-
-/** The level look `look` draws at: basic for look B once its PNG sky proved too slow. */
+/** The level look `look` draws at: basic for look B once the sky renderer failed. */
 function lookLevel(look: Look, level: Level): Level {
-  return look === 'B' && slowSkyMs !== undefined ? 'basic' : level
-}
-
-/** Whether the renderer paints the sky: then the mod draws no PNG sky and shows only its `{ file }` frames. */
-function skyActive(): boolean {
-  return sky.state === 'starting' || sky.state === 'running'
+  return look === 'B' && sky.state === 'failed' ? 'basic' : level
 }
 
 /** What the sky Image shows until the renderer's first frame: one pixel of the sky's dark ground. */
@@ -356,10 +336,9 @@ const SKY_WAIT = { rgba: 'BwYO/w==', width: 1, height: 1 }
 /** The sky renderer's state for `/swarm status`. */
 export function skyStatus(): string {
   const ms = [...sky.renderMs].sort((a, b) => a - b)
-  const slow = slowSkyMs === undefined ? '' : `, PNG sky took ${Math.round(slowSkyMs)} ms, look B basic`
-  if (sky.state === 'failed') return 'failed (' + sky.failure + '), PNG sky' + slow
+  if (sky.state === 'failed') return 'failed (' + sky.failure + '), look B draws the basic sky'
   const notes = [...(sky.crash === undefined ? [] : ['crashed once: ' + sky.crash]), ...(ms.length > 0 ? [`${ms[ms.length >> 1]!.toFixed(1)} ms a frame`] : [])]
-  return sky.state + (notes.length > 0 ? ` (${notes.join('; ')})` : '') + slow
+  return sky.state + (notes.length > 0 ? ` (${notes.join('; ')})` : '')
 }
 
 /**
@@ -406,7 +385,7 @@ export async function replayCommand($: EngineInterface, rest: string): Promise<{
   } catch (err) {
     return { text: `cannot read ${path}: ${String(err)}` }
   }
-  const lines = parseLog(text)
+  const lines = resolveCodes(parseLog(text))
   const runs = splitRuns(lines)
   const run = pickRun(lines, runs, args)
   if (run === undefined) return { text: `no run in ${path}${args.from !== undefined || args.to !== undefined ? ' between those times' : ''}` }
@@ -420,7 +399,7 @@ export async function replayCommand($: EngineInterface, rest: string): Promise<{
   stopReplay()
   const win = windowOf(lines, run.from, run.to)
   const scene = new Scene(modelsOf(rosterJson))
-  scene.seed(run.names, run.from)
+  scene.seed(run.names, run.from, false)
   replay = {
     ...newStage(args.look),
     ...(args.level === undefined ? {} : { level: args.level }),
@@ -444,12 +423,13 @@ export async function replayCommand($: EngineInterface, rest: string): Promise<{
 
 /**
  * The stage's tree: the control row first, so a body the host cuts short never hides it, then the bands of Rasters and
- * Images sized to the rows left, the caller's rows, and the claim paths when rich.
+ * Images sized to the rows the control row (as wrapped) and the caller's rows leave, the caller's rows, and the claim paths when rich.
  */
 async function renderStage($: EngineInterface, e: RenderInputOf<'Pane', 'terminal'>, s: Stage, level: Level, frameOf: FrameOf, controls: Control[], extra: RenderElement[]): Promise<RenderElement> {
   const { Box, Text, Raster, Image, Link } = $.ui.resolve(e)
-  const frameRows = Math.max(3, Math.min(60, e.props.scroll.bodyRows - (level === 'rich' ? 2 : 1) - extra.length))
   const cols = Math.max(20, e.props.bodyColumns)
+  const skyNote = s.look === 'B' && level === 'rich' && sky.state === 'failed' ? [Text({ dimColor: true, wrap: 'truncate-end', children: [`basic sky: the sky renderer failed (${sky.failure})`] })] : []
+  const frameRows = Math.max(3, Math.min(60, e.props.scroll.bodyRows - (level === 'rich' ? 1 : 0) - controlRows(controls, cols) - skyNote.length - extra.length))
   const now = await $.clock.now()
   const frame = frameOf(cols, frameRows, now)
   s.motionMs = frame.motionMs ?? 0
@@ -464,7 +444,7 @@ async function renderStage($: EngineInterface, e: RenderInputOf<'Pane', 'termina
       height: b.rows,
       children: b.pieces.map(p => {
         if (p.kind === 'raster') return Raster({ key: p.key, columns: p.cols, rows: b.rows, cells: frame.grid.cells(p.x, b.y, p.cols, b.rows) })
-        const source = p.layer.stream !== undefined && skyActive() ? (sky.source ?? SKY_WAIT) : takeImage($, s, p.layer, now).source
+        const source = p.layer.stream !== undefined ? (sky.source ?? SKY_WAIT) : s.images.take(p.layer, now).source
         const image = Image({ key: p.layer.key, columns: p.layer.cols, rows: p.layer.rows, source, alt: p.layer.alt })
         if (p.layer.ground === undefined) return image
         return Box({ key: p.layer.key + '-ground', width: p.layer.cols, height: p.layer.rows, backgroundColor: css(p.layer.ground), children: [image] })
@@ -478,7 +458,7 @@ async function renderStage($: EngineInterface, e: RenderInputOf<'Pane', 'termina
       void probe($)
     })
   }
-  const rows: RenderElement[] = [Box({ key: 'controls', flexDirection: 'row', flexWrap: 'wrap', columnGap: 2, children: buttons }), ...stage, ...extra]
+  const rows: RenderElement[] = [Box({ key: 'controls', flexDirection: 'row', flexWrap: 'wrap', columnGap: 2, children: buttons }), ...stage, ...skyNote, ...extra]
   if (level === 'rich' && frame.links.length > 0) {
     rows.push(Text({ dimColor: true, children: ['open: ', ...frame.links.flatMap((l, i) => [...(i > 0 ? ['  '] : []), Link({ href: l.href, label: l.label })])] }))
   }
@@ -508,11 +488,11 @@ export async function renderReplay($: EngineInterface, e: RenderInputOf<'Pane', 
   return renderStage($, e, r, levelOf(r.level), replayFrame(r), controlsOf(r.scene, r.filter, r.look, r.pausedAt !== undefined, r.isLiveWaiting), [])
 }
 
-/** The live pane in look A or B: the agents and the view buttons, the stage, then the caller's rows. */
-export async function renderLive($: EngineInterface, e: RenderInputOf<'Pane', 'terminal'>, source: () => LiveSource, extra: RenderElement[]): Promise<RenderElement> {
+/** The live pane in look A or B: the agents, the view buttons and `[ stop all ]` while a teammate is live, the stage, then the caller's rows. */
+export async function renderLive($: EngineInterface, e: RenderInputOf<'Pane', 'terminal'>, source: () => LiveSource, extra: RenderElement[], hasLive = false): Promise<RenderElement> {
   live.source = source
   const src = source()
-  const controls: Control[] = [...agentControls(src.scene, live.filter, live.look), ...viewControls(live.view, true)]
+  const controls: Control[] = [...agentControls(src.scene, live.filter, live.look), ...viewControls(live.view, true), ...stopControls(hasLive)]
   return renderStage($, e, live, levelOf(), liveFrame(src), controls, extra)
 }
 
@@ -525,6 +505,13 @@ export async function paneClosed($: EngineInterface) {
   live.settle = undefined
   live.size = undefined
   await quitSidecar($, sky)
+}
+
+/** What the live pane's `[ stop all ]` does: set by the mod at session start. */
+let stopAll: (() => Promise<void>) | undefined
+
+export function setStopAll(fn: () => Promise<void>) {
+  stopAll = fn
 }
 
 /** Shows a view: a look in the replay while one plays, else a look or the text list live. */
@@ -546,7 +533,9 @@ async function press($: EngineInterface, key: string) {
     const name = key.slice('agent-'.length)
     s.filter = s.filter === name ? undefined : name
     $.ui.invalidate('ui.render')
+    if (r === undefined && s.filter !== undefined) void $.ui.focus({ requestId: PANE, key: COMPOSE_KEY }).catch(() => undefined)
   } else if (key.startsWith('view-')) showView($, key.slice('view-'.length) as LiveView)
+  else if (key === STOP_ALL_KEY && r === undefined) await stopAll?.()
   else if (r === undefined) return
   else if (key === 'live') {
     stopReplay()

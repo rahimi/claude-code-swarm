@@ -1,7 +1,10 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
+import { machineTime } from './zone'
+
 const CWD = '/work'
+
 const T0 = Date.parse('2026-01-05T10:00:00Z')
 
 const LOG = [
@@ -94,6 +97,20 @@ test('replay plays a log into the pane by blit, filters on an agent press, and s
   await ui.unmount()
 })
 
+test('a replay shows each agent from its first log line, not from the run\'s start', async ($, on) => {
+  const log = LOG + JSON.stringify({ ts: T0 + 60_000, from: 'w3', to: 'w1', summary: '[PROPOSE] hello Kite', length: 20, via: 'send', type: 'PROPOSE' }) + '\n'
+  const w = world(on, undefined, log)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD } as never)
+  const r = (await $.command.run({ command: 'swarm', args: 'replay old/log.jsonl --speed 10' } as never)) as { text: string }
+  expect(r.text).toMatch(/^replaying w1–w3/)
+  const ui = await $.ui.mount(PANE as never)
+  expect(await ui.find({ type: 'Button', key: 'agent-w1' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'agent-w3' })).toBeUndefined()
+  for (let i = 0; i < 8; i++) await w.clock.advance(500)
+  expect(await ui.find({ type: 'Button', text: 'Kite' })).toBeDefined()
+  await ui.unmount()
+})
+
 test('replay reports what it cannot play', async ($, on) => {
   world(on)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD } as never)
@@ -108,7 +125,7 @@ test('the pane turns rich by itself where the terminal draws pictures, and the c
   await $.command.run({ command: 'swarm', args: 'replay old/log.jsonl --speed 10' } as never)
   const ui = await $.ui.mount(PANE as never)
   expect((await ui.findAll({ type: 'Image' })).map(i => i.key)).toEqual(['probe'])
-  await w.clock.advance(100)
+  await w.clock.advance(1_000)
   const keys = (await ui.findAll({ type: 'Image' })).map(i => i.key)
   expect(keys).toContain('bar-w1')
   expect(keys).not.toContain('probe')
@@ -205,7 +222,7 @@ test('the control row comes first and a short pane shrinks the stage, so the but
   await ui.unmount()
 })
 
-test('rich look B without the renderer: fading lit edges never send the PNG sky again, and the pane goes still', async ($, on) => {
+test('rich look B without the renderer: fading lit edges never send the sky again, and the pane goes still', async ($, on) => {
   const w = world(on)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD } as never)
   await $.command.run({ command: 'swarm', args: 'replay old/log.jsonl --speed 10 --look B --level rich' } as never)
@@ -245,7 +262,7 @@ test('a replay without flags plays the most recent run, and its playhead reaches
     for (let k = 0; k < words.length; k += 3) s += String.fromCharCode(words[k]!)
     return s
   }).join('')
-  expect(cells).toContain('11:07:00')
+  expect(cells).toContain(machineTime(Date.parse('2026-01-05T11:07:00Z')))
   await ui.unmount()
 })
 

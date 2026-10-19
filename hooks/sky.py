@@ -193,10 +193,31 @@ def backdrop(s):
 stills = {}
 
 
+# A 3 x 5 pixel font for the digits, one row of three bits per number, top row first.
+DIGITS = [
+    [7, 5, 5, 5, 7], [2, 6, 2, 2, 7], [7, 1, 7, 4, 7], [7, 1, 7, 1, 7], [5, 5, 7, 1, 1],
+    [7, 4, 7, 1, 7], [7, 4, 7, 5, 7], [7, 1, 1, 1, 1], [7, 5, 7, 5, 7], [7, 5, 7, 1, 7],
+]
+
+
+def digits(f, text, cx, cy, k, color):
+    """Draws a number in the pixel font, centred on (cx, cy), each font pixel k pixels square."""
+    h, w = f.shape[:2]
+    x0 = cx - (len(text) * 4 - 1) * k / 2
+    y0 = cy - 2.5 * k
+    for i, ch in enumerate(text):
+        for row, bits in enumerate(DIGITS[int(ch)]):
+            for col in range(3):
+                if bits & (4 >> col):
+                    x, y = int(round(x0 + (i * 4 + col) * k)), int(round(y0 + row * k))
+                    if 0 <= x and x + k <= w and 0 <= y and y + k <= h:
+                        f[y:y + k, x:x + k] = color
+
+
 def still(s, now):
-    """The backdrop with what does not move: the membrane, edges whose first comet has landed, leader lines, rays and beads."""
+    """The backdrop with what does not move: the membrane, edges whose first comet has landed, leader lines, rays and beads, and the wake count once the rays are capped."""
     edges = [e for e in s['edges'] if now - e.get('start', -math.inf) >= s['flightMs']]
-    key = json.dumps([s['w'], s['h'], s['centre'], s['u'], s['membrane'], edges, s['leaders'], s['rays'], s['beads']])
+    key = json.dumps([s['w'], s['h'], s['centre'], s['u'], s['membrane'], edges, s['leaders'], s['rays'], s['beads'], s.get('count', 0)])
     if key not in stills:
         stills.clear()
         f = backdrop(s).copy()
@@ -214,6 +235,8 @@ def still(s, now):
         for i in range(s['beads']):
             a = -math.pi / 2 + i * 2 * math.pi / 24
             disc(f, cx + math.cos(a) * rm, cy + math.sin(a) * rm, 1.1 * u, rgb(s['dim']))
+        if s.get('count'):
+            digits(f, str(s['count']), cx, cy + rm * 0.25, max(1, round(1.2 * u)), rgb(s['accent']))
         stills[key] = f
     return stills[key]
 

@@ -14,6 +14,15 @@ const RETRY_MS = 500
 /** The refusals that mean the terminal will never show a `{ file }` frame: no pictures at all, or no files read. */
 const CANNOT_SHOW = /draws no placeholder images|cannot read files on this machine/
 
+/** The commands that run the renderer, tried in turn until one starts with numpy: python3 from PATH, then uv with numpy. */
+const PYTHONS: readonly (readonly string[])[] = [['python3', '-I'], ['uv', 'run', '--no-project', '--with', 'numpy', 'python', '-I']]
+let pythons = PYTHONS
+
+/** The `skyPython` setting: a python path to run the renderer with instead of PYTHONS; empty, PYTHONS. */
+export function setSkyPython(path: string) {
+  pythons = path === '' ? PYTHONS : [[path, '-I']]
+}
+
 /** The renderer's state; the functions below act on it. */
 export type SkySidecar = {
   requestId: string
@@ -36,12 +45,15 @@ export type SkySidecar = {
   stderr: string
   dir: string
   stream: AsyncGenerator<unknown, unknown> | undefined
+  /** The index in `pythons` of the command that runs the renderer, and why each one before it did not. */
+  python: number
+  tried: string[]
   seq: number
   sent: string
 }
 
 export function newSidecar(requestId: string, key: string): SkySidecar {
-  return { requestId, key, state: 'off', failure: undefined, source: undefined, renderMs: [], crashes: 0, crash: undefined, isLeaving: false, stderr: '', pending: undefined, retryTimer: undefined, dir: '', stream: undefined, seq: 0, sent: '' }
+  return { requestId, key, state: 'off', failure: undefined, source: undefined, renderMs: [], crashes: 0, crash: undefined, isLeaving: false, stderr: '', pending: undefined, retryTimer: undefined, dir: '', stream: undefined, python: 0, tried: [], seq: 0, sent: '' }
 }
 
 /** Starts the renderer in `dir` while it is asked for (`starting`) and not yet spawned; its frames are blitted as they come. */
@@ -51,7 +63,7 @@ export function startSidecar($: EngineInterface, sc: SkySidecar, dir: string) {
   sc.sent = ''
   sc.isLeaving = false
   sc.stderr = ''
-  const stream = $.process.spawn({ argv: ['python3', '-I', `${$.plugin.root}/hooks/sky.py`, dir] })
+  const stream = $.process.spawn({ argv: [...pythons[sc.python]!, `${$.plugin.root}/hooks/sky.py`, dir] })
   sc.stream = stream
   void readSidecar($, sc, stream)
 }
@@ -83,7 +95,9 @@ async function readSidecar($: EngineInterface, sc: SkySidecar, stream: AsyncGene
       }
     }
   } catch (err) {
-    if (sc.stream === stream) failSidecar($, sc, 'renderer did not start: ' + String(err))
+    if (sc.stream !== stream) return
+    if (sc.state === 'starting') nextPython($, sc, String(err))
+    else failSidecar($, sc, 'renderer did not start: ' + String(err))
     return
   }
   if (sc.stream !== stream) return
@@ -108,6 +122,7 @@ async function sidecarLine($: EngineInterface, sc: SkySidecar, line: string) {
   const [kind, ...rest] = line.split(' ')
   if (kind === 'ready') sc.state = 'running'
   else if (kind === 'bye') sc.isLeaving = true
+  else if (kind === 'fail' && rest.join(' ') === 'numpy missing') nextPython($, sc, 'numpy missing')
   else if (kind === 'fail') failSidecar($, sc, rest.join(' '))
   else if (kind === 'frame' && sc.state !== 'failed') {
     const [file, gen, ms, w, h] = rest
@@ -168,6 +183,16 @@ export async function pauseSidecar($: EngineInterface, sc: SkySidecar) {
   sc.sent = 'pause'
   sc.pending = undefined
   await $.fs.write(sc.dir + '/scene.json', JSON.stringify({ seq: ++sc.seq, pause: true }))
+}
+
+/** Starts the renderer with the next command in `pythons`, the current one having failed for `why`; past the last, fails it. */
+function nextPython($: EngineInterface, sc: SkySidecar, why: string) {
+  sc.tried.push(`${pythons[sc.python]![0]}: ${why}`)
+  if (sc.python >= pythons.length - 1) return failSidecar($, sc, 'no python with numpy: ' + sc.tried.join('; '))
+  sc.python++
+  void sc.stream?.return(undefined)
+  sc.stream = undefined
+  startSidecar($, sc, sc.dir)
 }
 
 function failSidecar($: EngineInterface, sc: SkySidecar, why: string) {

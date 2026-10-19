@@ -9,7 +9,7 @@
       "name": "agent-swarm",
       "source": ".",
       "description": "Agent-team swarm: message log, roster, /swarm pane, lead wake modes, and the swarm protocol skill",
-      "version": "0.2.0"
+      "version": "0.3.0"
     }
   ]
 }

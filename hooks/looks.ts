@@ -1,7 +1,6 @@
 // What every pane look shares: the view it draws, the frame it returns, palettes, badges and small drawing helpers.
 
 import { Grid, hex, mix } from './grid'
-import type { ImageSource } from 'claude-code'
 
 import type { Canvas } from './pixels'
 import type { AgentState, Card, CardStatus, Level, ModelFamily, Scene, SceneAgent, SceneMessage } from './replay'
@@ -48,7 +47,7 @@ export type SkyLine = { a: XY; q: XY; b: XY; stop: number; rgb: RGB; age: number
 /**
  * Everything the sky renderer paints, in the picture's pixels: the backdrop's colours, the membrane, edges with their
  * weights, leader lines, the lead's rays and beads, the lit edges and comets, the agents; `u` and `nu` scale strokes and
- * marks, as the still sky's do.
+ * marks.
  */
 export type SkyScene = {
   w: number
@@ -69,6 +68,8 @@ export type SkyScene = {
   edges: { a: XY; q: XY; b: XY; w: number; rgb: RGB; lit: number; age?: number }[]
   leaders: { pts: XY[]; rgb: RGB; lit: number }[]
   rays: number
+  /** The lead's delivered wakes once the rays are capped, drawn as a number in the ring; 0 below the cap. */
+  count: number
   beads: number
   lit: SkyLine[]
   comets: SkyLine[]
@@ -80,8 +81,7 @@ export type SkyScene = {
 
 /**
  * A picture over a box of cells: `sig` names everything it draws from, so a pane sends it again only when `sig` changes,
- * at most once per `minMs` (default `IMAGE_MIN_MS`). `draw` makes the pixels, sent raw within `IMAGE_BUDGET`; a layer with
- * `source` sends what that makes instead (a PNG within `SKY_BUDGET`).
+ * at most once per `IMAGE_MIN_MS`. `draw` makes the pixels, sent raw within `IMAGE_BUDGET`.
  */
 export type ImageLayer = {
   key: string
@@ -91,8 +91,6 @@ export type ImageLayer = {
   rows: number
   sig: string
   draw: () => Canvas
-  source?: () => ImageSource
-  minMs?: number
   /** The colour of the cells under the picture, where a terminal that fits it inside its box leaves them bare. */
   ground?: number
   /** Set where a renderer process may paint this picture instead: the scene it paints. */
@@ -166,16 +164,9 @@ export function clock(ms: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`
 }
 
-/** `HH:MM:SS` in UTC. */
-export function timeOfDay(ts: number): string {
-  return new Date(ts).toISOString().slice(11, 19)
-}
-
 /** The most base64 characters an Image source may carry (about 75 KB of RGBA pixels), so a redraw never stalls the console. */
 export const IMAGE_BUDGET = 100_000
 
-/** The most base64 characters a PNG sky source may carry. */
-export const SKY_BUDGET = 300_000
 /** The least real time between two sky sources. */
 export const SKY_MIN_MS = 2_000
 /** Pixels per terminal cell, across and down: the types give a mod no cell size, so the common one. */
@@ -208,6 +199,27 @@ export function spaced(s: string): string {
 /** A brightness bump for an event `age` real ms old: full at once, gone after `ms`. */
 export function fade(age: number, ms = FLASH_MS): number {
   return age < 0 || age >= ms ? 0 : (1 - age / ms) ** 2
+}
+
+/** A left agent's light once its fade-out ends. */
+const LEFT_LIT = 0.35
+/** How long, in real ms, the header names an agent that joined or left. */
+export const MOVE_NOTE_MS = 10_000
+
+/** An agent's light, 0 → 1: rising over `FLASH_MS` after it joined; once it left, falling over `FLASH_MS` to `LEFT_LIT`. */
+export function presence(a: SceneAgent, v: View): number {
+  if (a.leftAt !== undefined && a.leftAt <= v.now) return LEFT_LIT + (1 - LEFT_LIT) * fade(v.age(a.leftAt))
+  return 1 - fade(v.age(a.joinedAt))
+}
+
+/** The header's note on the agents that joined or left in the last `MOVE_NOTE_MS`: `+ joined Kite · − left w2`. */
+export function movesNote(scene: Scene, v: View): string | undefined {
+  const isRecent = (t: number | undefined) => t !== undefined && t <= v.now && v.age(t) >= 0 && v.age(t) < MOVE_NOTE_MS
+  const hasLeft = (a: SceneAgent) => a.leftAt !== undefined && a.leftAt <= v.now
+  const joined = scene.order().filter(a => isRecent(a.joinedAt) && !hasLeft(a)).map(a => scene.label(a.name))
+  const left = scene.order().filter(a => isRecent(a.leftAt)).map(a => scene.label(a.name))
+  const parts = [...(joined.length > 0 ? [`+ joined ${joined.join(', ')}`] : []), ...(left.length > 0 ? [`− left ${left.join(', ')}`] : [])]
+  return parts.length > 0 ? parts.join(' · ') : undefined
 }
 
 /** The messages in flight now, each with how far it has travelled (0 → 1). */

@@ -1,10 +1,8 @@
 // Look B, "constellation": the team as a star map around the lead, messages as comets along its edges.
 
-import type { ImageSource } from 'claude-code'
-import { ago } from './core'
+import { ago, timeOfDay } from './core'
 
 import { Canvas } from './pixels'
-import { pngSource } from './png'
 import { cardTitle } from './replay'
 import type { AgentState, Scene, SceneAgent, SceneMessage } from './replay'
 import {
@@ -15,15 +13,15 @@ import {
   cardLinks,
   fade,
   mix,
+  movesNote,
   nameColor,
   palette,
-  SKY_BUDGET,
+  presence,
   SKY_MIN_MS,
   CELL_PX,
   sends,
   spaced,
   stateIn,
-  timeOfDay,
   touches,
   width,
 } from './looks'
@@ -200,7 +198,6 @@ function drawBasicSky(g: Grid, scene: Scene, v: View, geo: Geometry, wide: boole
   const pt = (p: { x: number; y: number }) => ({ x: p.x - geo.gx, y: (p.y - geo.gy) * 2 })
   const centre = pt({ x: geo.cx, y: geo.cy })
   const c = new Canvas(W, H, P.bg)
-  c.glow(centre.x, centre.y, Math.min(W, H) * 0.5, 0x120f2e, 1.0)
   const hs = Math.max(0.65, Math.min(1, geo.gw / 64))
 
   type Fly = { m: SceneMessage; age: number; a: { x: number; y: number }; b: { x: number; y: number }; stop: number; color: number }
@@ -276,7 +273,7 @@ function drawBasicSky(g: Grid, scene: Scene, v: View, geo: Geometry, wide: boole
     const a = scene.agents.get(n.name)!
     const state = stateIn(scene, a.name, v)
     const color = state === 'stalled' ? P.state.stalled : agentColor(P, a)
-    const lit = v.filter !== undefined && v.filter !== n.name ? 0.3 : 1
+    const lit = (v.filter !== undefined && v.filter !== n.name ? 0.3 : 1) * presence(a, v)
     const seg = a.segments[a.segments.length - 1]
     const bump = Math.max(seg === undefined ? 0 : fade(v.age(seg.from), FLASH_MS), flare.get(n.name) ?? 0)
     halos.push({ n, state, color, lit, bump })
@@ -377,15 +374,19 @@ function drawBasicSky(g: Grid, scene: Scene, v: View, geo: Geometry, wide: boole
     g.put(x, y, STATE_GLYPH[h.state], quant(h.state === 'quiet' ? P.rule : mix(P.bg, fg, h.lit)), cellBg(x, y))
   }
 
-  // Words: quiet, behind the head; with no label margins, a landed word rests under its receiver.
-  const write = (x0: number, y: number, text: string, fg: (x: number) => number) => {
-    if (y < geo.gy || y >= geo.gy + geo.gh) return
-    for (let i = 0; i < width(text); i++) {
-      const x = x0 + i
-      if (x < geo.gx || x >= geo.gx + geo.gw) continue
+  // Words: quiet, behind the head; with no label margins, a landed word rests under its receiver. A word is written whole
+  // where every cell it needs is in the box and holds only sky, with a sky cell (or the box edge) on each side, else not at all.
+  const fits = (x0: number, y: number, text: string) => {
+    if (y < geo.gy || y >= geo.gy + geo.gh || x0 < geo.gx || x0 + width(text) > geo.gx + geo.gw) return false
+    for (let x = Math.max(geo.gx, x0 - 1); x < Math.min(geo.gx + geo.gw, x0 + width(text) + 1); x++) {
       const ch = g.ch[y * g.cols + x]!
-      if (ch === 0x2580 || ch === 32 || (ch >= 0x2800 && ch <= 0x28ff)) g.put(x, y, text[i]!, quant(fg(x)), cellBg(x, y))
+      if (!(ch === 0x2580 || ch === 32 || (ch >= 0x2800 && ch <= 0x28ff))) return false
     }
+    return true
+  }
+  const write = (x0: number, y: number, text: string, fg: (x: number) => number) => {
+    if (!fits(x0, y, text)) return
+    for (let i = 0; i < width(text); i++) g.put(x0 + i, y, text[i]!, quant(fg(x0 + i)), cellBg(x0 + i, y))
   }
   for (const h of heads) {
     if (h.word === '') continue
@@ -467,151 +468,17 @@ function flightOf(scene: Scene, v: View): Flight | undefined {
   return { t: Math.min(1, start / FLIGHT_MS), comets }
 }
 
-/** What the PNG sky is drawn again for: the agents and their states, edge weights in quarters, the filter; lit edges and wakes wait for those. */
-function skySig(scene: Scene, v: View, geo: Geometry): string {
-  const states = scene.order().map(a => a.name + ':' + stateIn(scene, a.name, v)).join(',')
-  const edges = [...edgeWeights(scene).entries()].map(([k, e]) => k + Math.ceil(e.w * 4)).sort().join(',')
-  return [geo.gw, geo.gh, states, edges, v.filter ?? ''].join('/')
-}
-
-/** The least real time between two PNG skies, the fallback without the renderer: each costs the mod tens of ms. */
-export const FALLBACK_SKY_MS = 10_000
-
 /** The most pixels a sky is drawn with: a pane larger than about 1100 × 900 pixels gets a scaled-down sky. */
 const SKY_MAX_PX = 1_000_000
 
-let kept: { key: string; canvas: Canvas } | undefined
-
-/** The sky's still backdrop, its glow and stars, kept for the last size and centre. */
-function backdrop(W: number, H: number, ccx: number, ccy: number, u: number): Canvas {
-  const key = [W, H, ccx, ccy, u].join('/')
-  if (kept?.key === key) return kept.canvas
-  const c = new Canvas(W, H, P.bg)
-  c.glow(ccx, ccy, Math.min(W, H) * 0.45, 0x120f2e, 0.9)
-  for (let i = 0; i < (W * H) / (900 * u * u); i++) {
-    const b = hash(i, 29)
-    c.disc(hash(i, 7) * W, hash(i, 13) * H, (0.35 + b * 0.5) * u, mix(P.bg, P.text, 0.15 + b * 0.45))
-  }
-  kept = { key, canvas: c }
-  return c
-}
-
-/** The sky as a still picture: stars, edges, the membrane, the lead with its wakes as rays (delivered) and beads (held), the agents. */
-function drawRichSky(scene: Scene, v: View, geo: Geometry, lit: Map<string, Lit>, scale = 1): Canvas {
-  const kx = CELL_PX.w * scale
-  const ky = CELL_PX.h * scale
-  /** Pixel lengths below are given at 6 pixels a column; `u` scales them to this picture. */
-  const u = Math.max(0.4, kx / 6)
-  /** Nodes and the lead keep a size they read at. */
-  const nu = Math.max(0.75, u)
-  const W = geo.gw * kx
-  const H = geo.gh * ky
-  const px = (x: number) => (x - geo.gx) * kx
-  const py = (y: number) => (y - geo.gy) * ky
-  const ccx = px(Math.floor(geo.cx) + 0.5)
-  const ccy = py(Math.floor(geo.cy) + 0.5)
-  const c = backdrop(W, H, ccx, ccy, u).clone()
-  const rm = geo.membrane * kx
-  c.circle(ccx, ccy, rm, 0.7 * u, MEMBRANE, 0.9)
-  const node = (p: { x: number; y: number }) => ({ x: px(Math.floor(p.x) + 0.5), y: py(Math.floor(p.y) + 0.5) })
-  const bend = (a: { x: number; y: number }, b: { x: number; y: number }) => {
-    const mx = (a.x + b.x) / 2
-    const my = (a.y + b.y) / 2
-    return { x: mx + (ccx - mx) * 0.18, y: my + (ccy - my) * 0.18 }
-  }
-  for (const e of edgeWeights(scene).values()) {
-    const pa = pos(geo, e.a)
-    const pb = pos(geo, e.b)
-    if (pa === undefined || pb === undefined) continue
-    const a = node(pa)
-    const b = node(pb)
-    const lit = touches(v.filter, e.a, e.b) ? 1 : 0.2
-    const q = bend(a, b)
-    c.curve(a.x, a.y, q.x, q.y, b.x, b.y, (0.5 + 1.6 * e.w) * u, mix(nameColor(P, scene, e.a), nameColor(P, scene, e.b), 0.5), (0.08 + 0.3 * e.w) * lit, 0, 1, true)
-  }
-  if (geo.gx > 0) {
-    for (const n of geo.nodes) {
-      const color = agentColor(P, scene.agents.get(n.name))
-      const lit = v.filter !== undefined && v.filter !== n.name ? 0.3 : 1
-      const ex = n.side === 'left' ? 0 : W
-      const ey = py(n.labelRow + 0.5)
-      const p = node(n)
-      const kn = n.side === 'left' ? p.x - 2 * kx : p.x + 2 * kx
-      c.line(ex, ey, kn, ey, 0.45 * u, color, 0.35 * lit)
-      c.line(kn, ey, p.x, p.y, 0.45 * u, color, 0.35 * lit)
-    }
-  }
-  const rays = Math.min(scene.delivered, 24)
-  for (let i = 0; i < rays; i++) {
-    const a = -Math.PI / 2 + (i * 2 * Math.PI) / 24
-    c.line(ccx + Math.cos(a) * rm * 0.45, ccy + Math.sin(a) * rm * 0.45, ccx + Math.cos(a) * rm * 0.8, ccy + Math.sin(a) * rm * 0.8, 0.5 * u, P.accent, 0.9)
-  }
-  const beads = Math.min(scene.held, 24)
-  for (let i = 0; i < beads; i++) {
-    const a = -Math.PI / 2 + (i * 2 * Math.PI) / 24
-    c.disc(ccx + Math.cos(a) * rm, ccy + Math.sin(a) * rm, 1.1 * u, P.dim)
-  }
-  for (const l of lit.values()) {
-    const path = pathOf(geo, l.from, l.to, l.held)
-    if (path === undefined) continue
-    const color = nameColor(P, scene, l.from)
-    const a = node(path.a)
-    const b = node(path.b)
-    const q = bend(a, b)
-    c.curve(a.x, a.y, q.x, q.y, b.x, b.y, 1.2 * u, color, 0.3, 0, path.stop, true)
-    const t = Math.min(path.stop, 0.9)
-    const hx = (1 - t) * (1 - t) * a.x + 2 * (1 - t) * t * q.x + t * t * b.x
-    const hy = (1 - t) * (1 - t) * a.y + 2 * (1 - t) * t * q.y + t * t * b.y
-    c.glow(hx, hy, 6 * nu, color, 0.8)
-    c.disc(hx, hy, 1.6 * nu, 0xffffff)
-  }
-  c.glow(ccx, ccy, 9 * nu, P.accent, 0.7)
-  c.disc(ccx, ccy, 2.6 * nu, 0xffffff)
-  for (const n of geo.nodes) {
-    const a = scene.agents.get(n.name)!
-    const state = stateIn(scene, a.name, v)
-    const color = state === 'stalled' ? P.state.stalled : agentColor(P, a)
-    const lit = v.filter !== undefined && v.filter !== n.name ? 0.3 : 1
-    const { x: nx, y: ny } = node(n)
-    if (state === 'quiet') {
-      c.circle(nx, ny, 3 * nu, 0.5 * nu, P.rule)
-      continue
-    }
-    const halo = state === 'running' ? 9 : state === 'stalled' ? 8 : 5
-    c.glow(nx, ny, halo * nu, color, (state === 'idle' || state === 'ended' ? 0.25 : 0.6) * lit)
-    if (state === 'waiting') {
-      for (let k = 0; k < 12; k += 2) {
-        const a0 = (k * Math.PI) / 6
-        const a1 = ((k + 1) * Math.PI) / 6
-        c.line(nx + Math.cos(a0) * 7 * nu, ny + Math.sin(a0) * 7 * nu, nx + Math.cos(a1) * 7 * nu, ny + Math.sin(a1) * 7 * nu, 0.6 * nu, color, lit)
-      }
-    }
-    if (state === 'stalled') c.circle(nx, ny, 7 * nu, 0.9 * nu, P.state.stalled, lit)
-    if (state === 'idle' || state === 'ended') c.circle(nx, ny, 4 * nu, 0.7 * nu, color, 0.8 * lit)
-    else c.disc(nx, ny, 3 * nu, mix(color, 0xffffff, 0.55), lit)
-  }
-  return c
-}
-
-/**
- * The sky as a PNG at a cell's pixel size, at most `SKY_MAX_PX` pixels; one past `SKY_BUDGET` is drawn again at the
- * scale its size says fits, a tenth under, until it fits. Never skipped.
- */
-function skySource(scene: Scene, v: View, geo: Geometry, lit: Map<string, Lit>): ImageSource {
-  let scale = Math.min(1, Math.sqrt(SKY_MAX_PX / (geo.gw * CELL_PX.w * geo.gh * CELL_PX.h)))
-  for (;;) {
-    const c = drawRichSky(scene, v, geo, lit, scale)
-    const src = pngSource(c.rgb(), c.w, c.h)
-    if (src.png.length <= SKY_BUDGET || c.w * c.h <= 64) return src
-    scale *= Math.sqrt(SKY_BUDGET / src.png.length) * 0.9
-  }
-}
+/** The most rays the lead's delivered wakes draw; from this many on, their count shows in the ring too. */
+export const RAYS_MAX = 24
 
 const rgbOf = (c: number): [number, number, number] => [(c >> 16) & 255, (c >> 8) & 255, c & 255]
 
 /**
- * The sky as a scene for the renderer process, in the pixels of the still sky at the scale its PNG would start at: the
- * same edges, leader lines, rays, beads, agents and lit edges, and the burst in flight as comets that set off together.
+ * The sky as a scene for the renderer process, at a cell's pixel size scaled to at most `SKY_MAX_PX` pixels: the edges,
+ * leader lines, rays, beads, agents and lit edges, and the burst in flight as comets that set off together.
  */
 function skyScene(scene: Scene, v: View, geo: Geometry, lit: Map<string, Lit>, flight: Flight | undefined): SkyScene {
   const scale = Math.min(1, Math.sqrt(SKY_MAX_PX / (geo.gw * CELL_PX.w * geo.gh * CELL_PX.h)))
@@ -651,7 +518,7 @@ function skyScene(scene: Scene, v: View, geo: Geometry, lit: Map<string, Lit>, f
     const b = node(pb)
     return [{ a, q: bend(a, b), b, w: Math.ceil(e.w * 4) / 4, rgb: rgbOf(mix(nameColor(P, scene, e.a), nameColor(P, scene, e.b), 0.5)), lit: touches(v.filter, e.a, e.b) ? 1 : 0.2, ...(young ? { age } : {}) }]
   })
-  const dimmed = (name: string) => (v.filter !== undefined && v.filter !== name ? 0.3 : 1)
+  const dimmed = (name: string) => (v.filter !== undefined && v.filter !== name ? 0.3 : 1) * presence(scene.agents.get(name)!, v)
   const leaders = geo.gx === 0 ? [] : geo.nodes.map(n => {
     const p = node(n)
     const ey = (n.labelRow + 0.5 - geo.gy) * ky
@@ -680,8 +547,9 @@ function skyScene(scene: Scene, v: View, geo: Geometry, lit: Map<string, Lit>, f
     stalled: rgbOf(P.state.stalled),
     edges,
     leaders,
-    rays: Math.min(scene.delivered, 24),
-    beads: Math.min(scene.held, 24),
+    rays: Math.min(scene.delivered, RAYS_MAX),
+    count: scene.delivered >= RAYS_MAX ? scene.delivered : 0,
+    beads: Math.min(scene.held, RAYS_MAX),
     lit: [...lit.values()].flatMap(l => line(l.from, l.to, l.held, l.age)),
     comets: (flight?.comets ?? []).flatMap(m => line(m.from, m.to, m.held, flight!.t * FLIGHT_MS)),
     nodes,
@@ -719,24 +587,22 @@ export function lookB(scene: Scene, v: View): Frame {
   const r = g.textRight(v.cols - 1, 0, badge, P.dim)
   const rt = g.textRight(r - 2, 0, timeOfDay(v.now), P.text)
   const tx = g.text(3, 0, spaced(v.title), P.text, undefined, Math.min(v.cols - 30, rt - 5))
-  if (v.note !== undefined) g.text(tx + 2, 0, v.note, P.dim, undefined, rt - tx - 4)
+  const note = [v.note, movesNote(scene, v)].filter(n => n !== undefined).join(' · ')
+  if (note !== '') g.text(tx + 2, 0, note, P.dim, undefined, rt - tx - 4)
   let fadeMs = 0
   const flight = v.level === 'rich' ? flightOf(scene, v) : undefined
   const lit = v.level === 'rich' ? litEdges(scene, v) : undefined
   const stream = lit === undefined ? undefined : skyScene(scene, v, geo, lit.lit, flight)
   if (lit !== undefined) {
-    const sky = lit
-    fadeMs = sky.fadeMs
+    fadeMs = lit.fadeMs
     images.push({
       key: 'sky',
       x: geo.gx,
       y: geo.gy,
       cols: geo.gw,
       rows: geo.gh,
-      sig: skySig(scene, v, geo),
-      draw: () => drawRichSky(scene, v, geo, sky.lit),
-      source: () => skySource(scene, v, geo, sky.lit),
-      minMs: FALLBACK_SKY_MS,
+      sig: '',
+      draw: () => new Canvas(1, 1, P.bg),
       ground: P.bg,
       stream,
       alt: `star map of ${scene.agents.size} agents around the lead`,
@@ -790,12 +656,17 @@ export function lookB(scene: Scene, v: View): Frame {
   }
   let x = 1
   const cards = v.isEnded === true ? [] : scene.cards()
-  for (const card of cards.slice(0, 6)) {
-    const title = cardTitle(card.slice, 22)
-    if (x + width(title) + 4 > v.cols - 1) break
+  const titles = cards.slice(0, 6).map(c => cardTitle(c.slice, 22) + (c.isDuplicate ? ' ⚠' : ''))
+  const ends: number[] = []
+  for (const t of titles) ends.push((ends.at(-1) ?? 1) + width(t) + 5)
+  const fits = (n: number) => n === 0 || (ends[n - 1]! <= v.cols && (n === cards.length || ends[n - 1]! + width(`+${cards.length - n} more`) <= v.cols - 1))
+  let n = titles.length
+  while (!fits(n)) n--
+  cards.slice(0, n).forEach((card, i) => {
     x = g.text(x, y + 2, '■', P.status[card.status])
-    x = g.text(x + 1, y + 2, title, mix(P.text, P.bg, 0.15)) + 3
-  }
+    x = g.text(x + 1, y + 2, titles[i]!, mix(P.text, P.bg, 0.15)) + 3
+  })
+  if (n < cards.length) g.text(x, y + 2, `+${cards.length - n} more`, P.dim, undefined, v.cols - 1 - x)
   let wx = g.text(1, y + 3, 'lead', P.dim)
   wx = g.text(wx + 2, y + 3, '▲ ' + scene.delivered + ' woken', P.accent)
   g.text(wx + 2, y + 3, '▽ ' + scene.held + ' held at the membrane', P.dim)

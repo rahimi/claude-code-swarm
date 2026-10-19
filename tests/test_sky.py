@@ -36,6 +36,13 @@ class Motion(unittest.TestCase):
         self.assertEqual(sky.ripple(delivered, FLIGHT, FLIGHT), 0)
 
 
+class Count(unittest.TestCase):
+    def test_the_wake_count_draws_in_the_pixel_font(self):
+        f = sky.np.zeros((40, 60, 3), sky.np.float32)
+        sky.digits(f, '18', 30, 20, 2, sky.rgb([255, 0, 0]))
+        self.assertEqual(int((f[..., 0] > 0).sum()), (8 + 13) * 4)
+
+
 class Leave(unittest.TestCase):
     def test_leave_removes_its_empty_folder_and_keeps_one_with_other_files(self):
         for extra, kept in ((None, False), ('other.txt', True)):

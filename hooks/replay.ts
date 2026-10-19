@@ -3,15 +3,18 @@
 import {
   ClaimBoard,
   DEFAULT_STALL_MIN,
+  IDLE_ENDED_H,
   isModName,
   bareName,
-  claimOf,
+  claimOfLine,
   clauseOf,
   helloName,
   isHeldFromLead,
   isIdleLine,
   isToolLine,
   isLeadAddress,
+  isLeadRecipient,
+  mentionsTarget,
   renameName,
   reviewOf,
   shortModel,
@@ -76,6 +79,35 @@ export function isTeammateName(name: string): boolean {
   return name !== '' && !isLeadAddress(name) && !isModName(name) && name !== 'peer' && name !== 'coordinator'
 }
 
+/**
+ * The code names a log's senders gave themselves (`[PROPOSE] hello <Name>` or a rename), read line by line; a line sent to
+ * a code name instead of a team name (`h15 → jaspis`) is read as sent to the teammate that took it, so no phantom agent
+ * goes by a code name. A name some line was sent from stays itself.
+ */
+export class CodeBook {
+  private readonly owners = new Map<string, string>()
+  private readonly senders = new Set<string>()
+
+  /** The line with its receiver resolved; learns the sender's code name from it. */
+  read(e: LogEntry): LogEntry {
+    const from = bareName(e.from)
+    if (from !== '' && !isIdleLine(e)) this.senders.add(from)
+    if (!isIdleLine(e) && !isToolLine(e) && e.via !== 'receive' && isTeammateName(from)) {
+      const code = helloName(e.summary) ?? renameName(e.summary)
+      if (code !== undefined && code.toLowerCase() !== from) this.owners.set(code.toLowerCase(), from)
+    }
+    const to = bareName(e.to)
+    const owner = this.owners.get(to)
+    return owner === undefined || this.senders.has(to) ? e : { ...e, to: owner }
+  }
+}
+
+/** A log's lines with code-name receivers resolved (see `CodeBook`), in time order. */
+export function resolveCodes(lines: readonly LogEntry[]): LogEntry[] {
+  const book = new CodeBook()
+  return [...lines].sort((a, b) => a.ts - b.ts).map(e => book.read(e))
+}
+
 export type Run = { from: number; to: number; count: number; names: string[] }
 
 /** How long before a run's first teammate line the replay starts: the lead's own lines before it are its brief, not the run. */
@@ -86,19 +118,26 @@ export type Team = { names: string[]; firstAt: number; lastPeerAt: number }
 
 /**
  * The teams a log holds, from teammate-to-teammate lines in time order. A peer line belongs to the team either end talked
- * in within `REUSE_GAP_MS`; a line between two names with no such team founds a new one. The other end joins on that line,
- * sender or receiver, unless it is still talking in another team; a line between two teams founded within `BURST_MS` of
- * each other merges them. A team's names come in the order each first sent a peer line, as the looks place them. Agents that only write to the lead are in no team.
+ * in within `REUSE_GAP_MS`; a line between two names with no such team founds a new one. The sender joins on that line
+ * unless it is still talking in another team; the receiver too, unless it is asleep: its last message, to anyone, came
+ * more than `IDLE_ENDED_H` hours before, or `canJoin` (the roster's view: stopped, or dormant) says no. An asleep receiver
+ * joins only by sending a peer line itself, and a line from a teamless sender to an asleep one founds no team. A line between
+ * two teams founded within `BURST_MS` of each other merges them. A team's names come in the order each first sent a peer
+ * line, as the looks place them. Agents that only write to the lead are in no team.
  */
-export function teamsOf(lines: readonly LogEntry[], isMate: (name: string) => boolean = isTeammateName): Team[] {
+export function teamsOf(lines: readonly LogEntry[], isMate: (name: string) => boolean = isTeammateName, canJoin: (name: string, at: number) => boolean = () => true): Team[] {
   const out: Team[] = []
   const seen = new Map<string, { team: Team; at: number }>()
   const firstSent = new Map<Team, Map<string, number>>()
+  const lastSent = new Map<string, number>()
   for (const e of [...lines].sort((a, b) => a.ts - b.ts)) {
     if (isIdleLine(e) || isToolLine(e)) continue
     const from = bareName(e.from)
     const to = bareName(e.to)
+    const sentBefore = lastSent.get(to)
+    lastSent.set(from, e.ts)
     if (from === to || !isTeammateName(from) || !isTeammateName(to) || !isMate(from) || !isMate(to)) continue
+    const isAwake = (sentBefore === undefined || e.ts - sentBefore <= IDLE_ENDED_H * 3_600_000) && canJoin(to, e.ts)
     const teamOf = (n: string) => {
       const last = seen.get(n)
       return last !== undefined && e.ts - last.at <= REUSE_GAP_MS ? last.team : undefined
@@ -115,11 +154,12 @@ export function teamsOf(lines: readonly LogEntry[], isMate: (name: string) => bo
       firstSent.set(team, mine)
     }
     if (team === undefined) {
+      if (!isAwake) continue
       team = { names: [from, to], firstAt: e.ts, lastPeerAt: e.ts }
       out.push(team)
     } else {
       team.lastPeerAt = e.ts
-      for (const n of [from, to]) if (!team.names.includes(n) && teamOf(n) === undefined) team.names.push(n)
+      for (const n of isAwake ? [from, to] : [from]) if (!team.names.includes(n) && teamOf(n) === undefined) team.names.push(n)
     }
     for (const n of [from, to]) if (team.names.includes(n)) seen.set(n, { team, at: e.ts })
     if (!firstSent.has(team)) firstSent.set(team, new Map())
@@ -134,17 +174,21 @@ export function teamsOf(lines: readonly LogEntry[], isMate: (name: string) => bo
 
 /**
  * The runs a log holds, one per team: from `LEAD_IN_MS` before its first peer message to the last line from or to one of
- * its members before a later team that shares a name starts.
+ * its members before a later team that shares a name starts, or before the first gap of over `REUSE_GAP_MS` between them.
  */
 export function splitRuns(lines: readonly LogEntry[]): Run[] {
-  const sorted = [...lines].sort((a, b) => a.ts - b.ts)
+  const sorted = resolveCodes(lines)
   const teams = teamsOf(sorted)
   return teams.map((t, i) => {
     const next = teams.slice(i + 1).find(n => n.names.some(x => t.names.includes(x)))
     const end = next?.firstAt ?? Infinity
     const from = t.firstAt - LEAD_IN_MS
     let to = t.lastPeerAt
-    for (const e of sorted) if (e.ts >= t.firstAt && e.ts < end && (t.names.includes(bareName(e.from)) || t.names.includes(bareName(e.to)))) to = Math.max(to, e.ts)
+    for (const e of sorted) {
+      if (e.ts < t.firstAt || e.ts >= end || !(t.names.includes(bareName(e.from)) || t.names.includes(bareName(e.to)))) continue
+      if (e.ts - to > REUSE_GAP_MS) break
+      to = Math.max(to, e.ts)
+    }
     return { from, to, count: sorted.filter(e => e.ts >= from && e.ts <= to).length, names: t.names }
   })
 }
@@ -197,6 +241,8 @@ export type SceneAgent = {
   received: number
   /** When it sent each message. */
   sends: number[]
+  /** When it made each tool call, as the ACT lines' running count gives them (one entry per call). */
+  callTimes: number[]
   segments: Segment[]
   /** The file it last edited, wrote or read, as the log's FILE line gives it: `✎ hooks/core.ts`. */
   file?: string
@@ -204,9 +250,13 @@ export type SceneAgent = {
   action?: string
   /** How many tool calls it had made by its latest ACT line. */
   calls?: number
+  /** When it joined: its JOIN line, else when it entered the scene. */
+  joinedAt: number
+  /** When it left, as its LEFT line gives it. */
+  leftAt?: number
 }
 
-export type MessageKind = 'send' | 'receive' | 'idle'
+export type MessageKind = 'send' | 'receive' | 'idle' | 'refused'
 
 export type SceneMessage = {
   ts: number
@@ -242,7 +292,9 @@ export class Scene {
   readonly board = new ClaimBoard()
   private readonly cardAt = new Map<string, number>()
   private readonly paths = new Map<string, string>()
-  private readonly done = new Map<string, number>()
+  /** When each slice was last reported done, and last claimed. */
+  private readonly doneAt = new Map<string, number>()
+  private readonly claimedAt = new Map<string, number>()
   /** The seeded team; once set, no other name becomes an agent and lines between non-members are left out. */
   private members: Set<string> | undefined
   startedAt: number | undefined
@@ -266,11 +318,11 @@ export class Scene {
     return [...this.agents.values()].sort((a, b) => a.index - b.index)
   }
 
-  /** Adds the run's teammates up front, in this order, so the layout holds still while they start. */
-  seed(names: readonly string[], at: number) {
+  /** Sets the run's teammates; when `upFront`, adds them at once in this order, so the layout holds still while they start, else each at its first line. */
+  seed(names: readonly string[], at: number, upFront = true) {
     this.startedAt ??= at
     this.members = new Set(names)
-    for (const n of names) this.agent(n, at, true)
+    if (upFront) for (const n of names) this.agent(n, at, true)
   }
 
   /** The agent of a name; a teammate not yet seen is added when `create` (it sent a line), else undefined. */
@@ -279,7 +331,7 @@ export class Scene {
     let a = this.agents.get(name)
     if (a === undefined) {
       if (!create) return undefined
-      a = { name, index: this.agents.size, sent: 0, received: 0, sends: [], segments: [] }
+      a = { name, index: this.agents.size, sent: 0, received: 0, sends: [], callTimes: [], segments: [], joinedAt: ts }
       const model = this.models(name, this.startedAt ?? ts)
       if (model !== undefined) a.model = model
       this.agents.set(name, a)
@@ -291,6 +343,12 @@ export class Scene {
     const last = a.segments[a.segments.length - 1]
     if (last?.state === state) return
     a.segments.push({ state, from: ts, holdsClaim: this.board.openClaims(a.name).length > 0 })
+  }
+
+  /** Counts a wake the mod itself gave the lead at `ts` (a wake mode or a watchdog), in time order; it reached the lead. */
+  noteWake(ts: number) {
+    const i = this.wakes.findIndex(w => w.ts > ts)
+    this.wakes.splice(i < 0 ? this.wakes.length : i, 0, { ts, held: false })
   }
 
   /** Whether a line repeats the previous one of the same sender and text within 3 s (a tool call and its send). */
@@ -309,7 +367,19 @@ export class Scene {
     this.now = Math.max(this.now, e.ts)
     const from = bareName(e.from) || e.from
     const to = bareName(e.to) || e.to
+    if (e.type === 'REFUSED') {
+      if (isLeadAddress(from) || this.agent(from, e.ts, true) !== undefined) this.messages.push({ ts: e.ts, from, to, type: 'REFUSED', summary: e.summary, kind: 'refused' })
+      return
+    }
     if (this.members !== undefined && !this.members.has(from) && !this.members.has(to)) return
+    if (e.type === 'JOIN' || e.type === 'LEFT') {
+      const a = this.agent(from, e.ts, true)
+      if (a !== undefined && e.type === 'JOIN') {
+        a.joinedAt = e.ts
+        delete a.leftAt
+      } else if (a !== undefined) a.leftAt = e.ts
+      return
+    }
     if (e.type === 'FILE') {
       const a = this.agent(from, e.ts, true)
       if (a !== undefined) {
@@ -322,7 +392,9 @@ export class Scene {
       const a = this.agent(from, e.ts, true)
       if (a !== undefined) {
         a.action = e.summary
-        a.calls = e.calls ?? (a.calls ?? 0) + 1
+        const calls = e.calls ?? (a.calls ?? 0) + 1
+        for (let i = a.calls === undefined ? 1 : Math.max(1, calls - a.calls); i > 0; i--) a.callTimes.push(e.ts)
+        a.calls = calls
         this.enter(a, 'running', e.ts)
       }
       return
@@ -337,13 +409,13 @@ export class Scene {
     const isSend = e.via !== 'receive'
     if (isSend && this.isRepeat(e, from, to)) return
     const sender = this.agent(from, e.ts, isSend)
-    const receiver = this.agent(to, e.ts, false)
+    const receiver = this.agent(to, e.ts, this.members !== undefined)
     const type = e.type ?? typeOf(e.summary)
     const m: SceneMessage = { ts: e.ts, from, to, summary: e.summary, kind: isSend ? 'send' : 'receive' }
     if (type !== undefined) m.type = type
-    if (isLeadAddress(to) && sender !== undefined) {
+    if (isLeadRecipient(to) && sender !== undefined) {
       m.held = isHeldFromLead(e.summary, undefined)
-      if (isSend || !this.messages.some(x => x.kind === 'send' && x.from === from && isLeadAddress(x.to) && x.summary === e.summary)) this.wakes.push({ ts: e.ts, held: m.held })
+      if (isSend || !this.messages.some(x => x.kind === 'send' && x.from === from && isLeadRecipient(x.to) && x.summary === e.summary)) this.wakes.push({ ts: e.ts, held: m.held })
     }
     this.messages.push(m)
     if (sender !== undefined) {
@@ -358,7 +430,7 @@ export class Scene {
         this.enter(sender, type === 'WAIT' ? 'waiting' : 'running', e.ts)
       }
       if (receiver !== undefined) receiver.received++
-      if ((sender !== undefined || isLeadAddress(from)) && (receiver !== undefined || isLeadAddress(to))) {
+      if ((sender !== undefined || isLeadAddress(from)) && (receiver !== undefined || isLeadRecipient(to))) {
         const key = (isLeadAddress(from) ? 'team-lead' : from) + '>' + (isLeadAddress(to) ? 'team-lead' : to)
         this.edges.set(key, (this.edges.get(key) ?? 0) + 1)
       }
@@ -366,7 +438,7 @@ export class Scene {
   }
 
   private claims(by: string, e: LogEntry, isSend: boolean) {
-    const ref = claimOf(e.summary)
+    const ref = claimOfLine(e)
     const touch = (target: string) => {
       const slice = sliceOf(target, this.board.deliverables)
       this.cardAt.set(slice, e.ts)
@@ -376,17 +448,30 @@ export class Scene {
     if (ref !== undefined) {
       const path = ref.role === 'build' ? /(?:^|\s)(\/\S+\/[^\s/]+\.\w+)/.exec(ref.target)?.[1] : undefined
       if (path !== undefined) this.board.addDeliverables([path])
-      if (this.board.claim(by, ref, isSend) || isSend) touch(ref.target)
+      if (this.board.claim(by, ref, isSend) || isSend) {
+        touch(ref.target)
+        this.claimedAt.set(sliceOf(ref.target, this.board.deliverables), e.ts)
+      }
     }
+    this.board.release(by, e.summary)
     const verdict = reviewOf(e.summary)
     if (verdict !== undefined && this.board.review(by, verdict)) this.cardAt.set(verdict.slice, e.ts)
     const type = typeOf(e.summary)
-    if (type !== undefined && REPORTS.includes(type) && this.board.report(by, type, isSend) && type === 'DONE') this.done.set(by, e.ts)
+    if (type !== undefined && REPORTS.includes(type) && this.board.report(by, type, isSend, e.summary) && type === 'DONE') {
+      const mine = this.board.all().filter(c => c.by.includes(by) && (c.role === 'build' || c.role === 'research'))
+      const named = mine.filter(c => mentionsTarget(e.summary.replace(/^\s*\[DONE\]\s*/i, ''), c.target))
+      for (const c of named.length > 0 ? named : mine) {
+        const slice = sliceOf(c.target, this.board.deliverables)
+        this.doneAt.set(slice, e.ts)
+        this.cardAt.set(slice, e.ts)
+      }
+    }
   }
 
-  /** An agent's state at `t`: its segment then, `stalled` once idle past the stall time while it held a claim, `quiet` before its first line. */
+  /** An agent's state at `t`: `ended` once it left, else its segment then, `stalled` once idle past the stall time while it held a claim, `quiet` before its first line. */
   stateAt(name: string, t = this.now): AgentState {
     const a = this.agents.get(name)
+    if (a?.leftAt !== undefined && a.leftAt <= t) return 'ended'
     const seg = a === undefined ? undefined : [...a.segments].reverse().find(s => s.from <= t)
     if (seg === undefined) return 'quiet'
     if (seg.state === 'idle' && seg.holdsClaim && t - seg.from >= this.stallMs) return 'stalled'
@@ -396,8 +481,15 @@ export class Scene {
   /** How long, in ms, an agent has been in its state at `t`. */
   stateFor(name: string, t = this.now): number {
     const a = this.agents.get(name)
+    if (a?.leftAt !== undefined && a.leftAt <= t) return t - a.leftAt
     const seg = a === undefined ? undefined : [...a.segments].reverse().find(s => s.from <= t)
     return seg === undefined ? 0 : t - seg.from
+  }
+
+  /** Whether another agent of the run took the same code name, in any case. */
+  isDuplicateCode(name: string): boolean {
+    const code = this.agents.get(name)?.code?.toLowerCase()
+    return code !== undefined && [...this.agents.values()].some(a => a.name !== name && a.code?.toLowerCase() === code)
   }
 
   /** An agent's code name, with its team name when another agent of the run took the same one; the name itself for anyone else. */
@@ -447,9 +539,9 @@ export class Scene {
       const held = [...(holding.get(card) ?? [])]
       card.isDuplicate = held.filter(h => h.startsWith('build ')).length > 1 || held.filter(h => h.startsWith('research ')).length > 1
       const states = card.reviewers.map(r => r.state)
-      if (states.includes('block') || card.isDuplicate) card.status = 'blocked'
+      if (states.includes('block')) card.status = 'blocked'
       else if (states.includes('approve')) card.status = 'approved'
-      else if (card.builders.some(b => (this.done.get(b) ?? 0) >= card.at)) card.status = 'done'
+      else if (this.doneAt.has(card.slice) && this.doneAt.get(card.slice)! >= (this.claimedAt.get(card.slice) ?? -Infinity)) card.status = 'done'
       else if (card.builders.length > 0) card.status = 'building'
       else if (card.reviewers.length === 0 && card.others.length === 0) card.status = 'unclaimed'
     }
@@ -467,10 +559,15 @@ const LIVE_LINES = 5_000
 export class LiveScene {
   private readonly lines: LogEntry[] = []
   private readonly talk: LogEntry[] = []
-  private built: { key: string; scene: Scene; applied: number } | undefined
+  /** When the mod itself woke the lead. */
+  private readonly modWakes: number[] = []
+  private built: { key: string; scene: Scene; applied: number; woken: number } | undefined
   private teams: { key: string; team: Team | undefined } | undefined
+  private readonly codes = new CodeBook()
 
-  push(e: LogEntry) {
+  /** Adds a line, its code-name receiver resolved (see `CodeBook`). */
+  push(line: LogEntry) {
+    const e = this.codes.read(line)
     if (!isToolLine(e) && !isIdleLine(e)) {
       this.talk.push(e)
       if (this.talk.length > LIVE_LINES) this.talk.splice(0, this.talk.length - LIVE_LINES)
@@ -482,10 +579,19 @@ export class LiveScene {
     }
   }
 
-  /** The current team: the latest whose members messaged each other; worked out again when a line or `version` changed. */
-  team(isMate: (name: string) => boolean, version = ''): Team | undefined {
+  /** Records that the mod woke the lead at `ts`; the scene counts it with the lead's other wakes. */
+  wake(ts: number) {
+    this.modWakes.push(ts)
+    if (this.modWakes.length > LIVE_LINES) {
+      this.modWakes.splice(0, this.modWakes.length - LIVE_LINES)
+      this.built = undefined
+    }
+  }
+
+  /** The current team: the latest whose members messaged each other (see `teamsOf`); worked out again when a line or `version` changed. */
+  team(isMate: (name: string) => boolean, version = '', canJoin?: (name: string, at: number) => boolean): Team | undefined {
     const key = `${this.talk.length}:${this.talk.at(-1)?.ts}:${version}`
-    if (this.teams?.key !== key) this.teams = { key, team: teamsOf(this.talk, isMate).at(-1) }
+    if (this.teams?.key !== key) this.teams = { key, team: teamsOf(this.talk, isMate, canJoin).at(-1) }
     return this.teams.team
   }
 
@@ -495,23 +601,24 @@ export class LiveScene {
     if (this.built?.key !== key) {
       const scene = new Scene(models, stallMs)
       scene.seed(names, from)
-      this.built = { key, scene, applied: 0 }
+      this.built = { key, scene, applied: 0, woken: 0 }
     }
     const b = this.built
     for (; b.applied < this.lines.length; b.applied++) {
       const e = this.lines[b.applied]!
       if (e.ts >= from) b.scene.apply(e)
     }
+    for (; b.woken < this.modWakes.length; b.woken++) if (this.modWakes[b.woken]! >= from) b.scene.noteWake(this.modWakes[b.woken]!)
     return b.scene
   }
 }
 
-/** A short title for a run: its teammates as a range when they share a stem (`r1–r4`), else listed. */
+/** A short title for a run: its teammates as a range when they share a stem (`r1–r4`, `h01–h18` with the digits as named), else listed. */
 export function runTitle(names: readonly string[]): string {
   const m = names.map(n => /^([a-z-]*?)(\d+)$/.exec(n))
   const stem = m[0]?.[1]
   if (names.length > 1 && m.every(x => x !== null && x[1] === stem)) {
-    const nums = m.map(x => Number(x![2])).sort((a, b) => a - b)
+    const nums = m.map(x => x![2]!).sort((a, b) => Number(a) - Number(b))
     return `${stem}${nums[0]}–${stem}${nums[nums.length - 1]}`
   }
   return names.join(' ')

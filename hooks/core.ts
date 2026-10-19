@@ -30,24 +30,30 @@ const LABEL_MAX = 28
 const EARLIER = '── earlier ──'
 export const OTHER_AGENTS = '── other agents ──'
 const STALE_MS = 10 * 60_000
+/** How many rows the text list shows under `other agents` and under `earlier`, the newest; the rest as `… N more`. */
+export const OTHERS_SHOWN = 5
+/** Hours a teammate stays idle before the pane and the band show it as ended (see `Roster.isDormant`). */
+export const IDLE_ENDED_H = 6
 /** The statuses of an agent that has ended. */
 export const ENDED: readonly string[] = ['completed', 'failed', 'killed']
 
 const LEAD_ALIASES = new Set(['team-lead', 'main', 'lead', 'orchestrator'])
 const MENTION = /(^|[^\w@])@(lead|orchestrator|main|team-lead)\b/i
-const TYPE_TAG = /^\s*\[(PROPOSE|CLAIM|LOCK|WAIT|ASK|REVIEW|BLOCK|HANDOFF|DONE)\]/i
+const TYPE_TAG = /^\s*(?:swarm:\s*)?\[(PROPOSE|CLAIM|LOCK|WAIT|ASK|REVIEW|BLOCK|HANDOFF|DONE|RELEASE|WITHDRAW)\]/i
 /** The order stamp line the mod puts before a teammate-to-teammate message (`#412 · 17:04:12`), after any envelope tag. */
 const STAMP_LINE = /^(\s*(?:<[^>]*>\s*)?)#\d+ · \d\d:\d\d:\d\d[^\S\n]*\n/
 const HELLO = /^(?:<[^>]*>\s*)?\[PROPOSE\]\s+hello\s+([A-Za-z][\w-]{0,23})\b/i
-const NAME = '([A-Za-z][\\w-]{0,23})\\b'
+const NAME = '[\\"\'`“]?([A-Za-z][\\w-]{0,23})\\b'
 const CAP_NAME = '([A-Z][\\w-]{0,23})\\b'
 const SELF = "\\bI(?:'m)?\\b(?:\\s*\\([^)]*\\))?"
 const RENAMES: readonly RegExp[] = [
   new RegExp(SELF + '\\s+(?:am\\s+|have\\s+)?(?:now\\s+)?renam(?:e|ed|ing)\\s+(?:myself\\s+)?(?:to\\s+|as\\s+)?' + NAME, 'i'),
   new RegExp('^renamed\\s+(?:to\\s+)?' + NAME, 'i'),
-  new RegExp('\\((?:now|renamed(?:\\s+to)?)\\s+' + NAME + '\\s*\\)', 'i'),
+  new RegExp('\\(renamed(?:\\s+to)?\\s+' + NAME + '\\s*\\)', 'i'),
+  new RegExp('\\([Nn]ow\\s+' + CAP_NAME + '\\s*\\)'),
   new RegExp('\\bcall\\s+me\\s+' + NAME, 'i'),
   new RegExp('\\bnow\\s+(?:called|named|known\\s+as|going\\s+by)\\s+' + NAME, 'i'),
+  new RegExp("\\bI(?:'m|\\s+am)\\s+(?![\\w-]*ing\\b)" + NAME + '\\s+from\\s+now\\s+on', 'i'),
   new RegExp(SELF + '\\s+(?:am\\s+)?now\\s+' + CAP_NAME),
   new RegExp(SELF + '\\s+am\\s+' + CAP_NAME),
   new RegExp("\\bI'm\\s+" + CAP_NAME),
@@ -71,6 +77,8 @@ export type LogEntry = {
   /** On an ACT line: how many tool calls the teammate had made by then. */
   calls?: number
   idleReason?: string
+  /** The claim the whole message made (see `claimOf`), also when it was not on the first line. */
+  claim?: ClaimRef
   session?: string
   fromId?: string
   toId?: string
@@ -95,6 +103,8 @@ export type RosterEntry = {
   isListed?: boolean
   /** The Workflow run that started it (`wf_…`), for a workflow script's agent. */
   workflowRunId?: string
+  /** The agent whose loop spawned it (`parentAgentId`); absent when the main loop did. */
+  parentId?: string
 }
 
 /** Whether an agent was started by a workflow script: `agent.spawn`'s `workflow`, or the type the engine gives such agents. */
@@ -109,6 +119,7 @@ export type AgentRow = {
   status: string
   teammateId?: string
   description: string
+  parentId?: string
 }
 
 /** The address without its `@team` suffix, lower-cased. */
@@ -120,14 +131,25 @@ export function isLeadAddress(address: string): boolean {
   return LEAD_ALIASES.has(bareName(address))
 }
 
+/** Whether a message sent to `address` reaches the lead: `team-lead`, or `main`; `lead` and `orchestrator` name it only in a mention. */
+export function isLeadRecipient(address: string): boolean {
+  const name = bareName(address)
+  return name === LEAD || name === 'main'
+}
+
 /** A message without the order stamp line the mod put before it. */
 export function unstamped(text: string): string {
   return text.replace(STAMP_LINE, '$1')
 }
 
-/** The stamp line put before a teammate-to-teammate message: its order `n` in the session and the time it was sent. */
+/** `HH:MM:SS` in the local time zone: the one clock of the pane, the text list and the stamps. */
+export function timeOfDay(ts: number): string {
+  return new Date(ts - new Date(ts).getTimezoneOffset() * 60_000).toISOString().slice(11, 19)
+}
+
+/** The stamp line put before a teammate-to-teammate message: its order `n` in the session and the local time it was sent. */
 export function stampLine(n: number, ts: number): string {
-  return `#${n} · ${new Date(ts).toISOString().slice(11, 19)}`
+  return `#${n} · ${timeOfDay(ts)}`
 }
 
 export function firstLine(text: string, max = 160): string {
@@ -169,7 +191,7 @@ export function helloName(text: string): string | undefined {
 /**
  * The new code name a sender gives itself anywhere in a message: `I (t3) rename to kite`, `renamed Kite` at a line's start
  * (after its type tag), `(renamed kite)`, `(now Kite)`, `call me Kite`, `now called Kite`, `I am now Kite`, `I am Kite`, `I'm Kite`.
- * The last three need a capitalised name.
+ * `(now Kite)` and the last three need a capitalised name. A name may be quoted, and `I'm kite from now on` renames to a name that does not end in `ing`.
  */
 export function renameName(text: string): string | undefined {
   for (const raw of text.split('\n')) {
@@ -245,6 +267,27 @@ export class Roster {
   earlier: RosterEntry[] = []
   /** Whether the lead is in a turn. */
   leadBusy = false
+  /** The time of the latest `merge` or `hydrate` that gave one, against which an idle teammate's age is read. */
+  private seenAt = -Infinity
+  /** Whether a teammate (bare team name) holds a registered wait or an open claim; such a teammate is never dormant. */
+  isHeld: (name: string) => boolean = () => false
+
+  /**
+   * Whether a teammate is dormant: reported `idle`, holding no wait or open claim, and without a status change, message or
+   * idle notice for over `IDLE_ENDED_H` hours at `now`. Display only: the pane and the band show it as ended; the team,
+   * claims, waits and watchdogs still count it live.
+   */
+  isDormant(a: RosterEntry, now = this.seenAt): boolean {
+    if (!a.isTeammate || a.status !== 'idle' || a.statusAt === undefined) return false
+    const name = bareName(a.name)
+    const lastSeen = Math.max(a.statusAt, this.lastMessageAt.get(name) ?? -Infinity, this.idle.get(name)?.lastAt ?? -Infinity)
+    return now - lastSeen > IDLE_ENDED_H * 3_600_000 && !this.isHeld(name)
+  }
+
+  /** Whether the pane and the band show an agent as ended: completed, failed or killed, or dormant. */
+  isShownEnded(a: RosterEntry, now = this.seenAt): boolean {
+    return ENDED.includes(a.status) || this.isDormant(a, now)
+  }
 
   /** Counts one idle notification from `sender`, received at `ts`. */
   noteIdle(sender: string, reason?: string, ts?: number) {
@@ -294,11 +337,19 @@ export class Roster {
     return true
   }
 
+  /** The bare team name of another current agent that uses `name`'s code name (any case), or undefined. */
+  clashWith(name: string): string | undefined {
+    const n = bareName(name)
+    const code = this.codeNames.get(n)?.toLowerCase()
+    if (code === undefined) return undefined
+    return [...this.agents.values()].filter(a => !this.isShownEnded(a)).map(a => bareName(a.name)).find(o => o !== n && this.codeNames.get(o)?.toLowerCase() === code)
+  }
+
   /** Bare team names of current agents whose code name another current agent also uses, case-insensitively. */
   duplicateCodes(): Set<string> {
     const byCode = new Map<string, string[]>()
     for (const a of this.agents.values()) {
-      if (ENDED.includes(a.status)) continue
+      if (this.isShownEnded(a)) continue
       const name = bareName(a.name)
       const code = this.codeNames.get(name)?.toLowerCase()
       if (code === undefined) continue
@@ -319,13 +370,13 @@ export class Roster {
   }
 
   /**
-   * Whether an agent belongs under `other agents`: outside the current team while a team exists, completed, failed or
-   * killed, or pending for more than `STALE_MS`.
+   * Whether an agent belongs under `other agents`: outside the current team while a team exists, shown as ended (see `isShownEnded`),
+   * or pending for more than `STALE_MS`.
    */
   isOther(a: RosterEntry, now: number): boolean {
     const team = this.currentTeam()
     if (team !== undefined && (!a.isTeammate || (a.teammateId?.split('@')[1] ?? '') !== team)) return true
-    if (ENDED.includes(a.status)) return true
+    if (this.isShownEnded(a, now)) return true
     return a.status === 'pending' && a.statusAt !== undefined && now - a.statusAt > STALE_MS
   }
 
@@ -348,8 +399,12 @@ export class Roster {
     return name
   }
 
-  /** Restores a roster.json: this session's agents rejoin the roster, a previous session's go to `earlier`. */
+  /**
+   * Restores a roster.json: this session's agents rejoin the roster, a previous session's go to `earlier`. A restored agent
+   * of this session that has not ended counts as listed, so the next `merge` that does not report it marks it completed.
+   */
   hydrate(json: unknown, session: string, now?: number) {
+    if (now !== undefined) this.seenAt = Math.max(this.seenAt, now)
     if (!json || typeof json !== 'object') return
     const j = json as { session?: unknown; agents?: unknown }
     if (!Array.isArray(j.agents)) return
@@ -374,6 +429,7 @@ export class Roster {
         entry.status = 'completed'
         entry.statusAt = now
       }
+      if (isCurrent && !isWorkflowAgent(entry) && !ENDED.includes(entry.status)) entry.isListed = true
       if (typeof a.codeName === 'string' && !this.codeNames.has(bareName(entry.name))) this.codeNames.set(bareName(entry.name), a.codeName)
       if (isCurrent) {
         if (!this.agents.has(entry.id)) this.agents.set(entry.id, entry)
@@ -390,15 +446,21 @@ export class Roster {
     }
   }
 
-  /** The bare team name an agent goes by, given its team name or its code name. */
+  /**
+   * The bare team name an agent goes by, given its team name or its code name. A code name several agents took goes to the
+   * one that has not ended, else to the latest started.
+   */
   resolve(nameOrCode: string): string {
     const n = bareName(nameOrCode)
-    for (const [name, code] of this.codeNames) if (code.toLowerCase() === n) return name
-    return n
+    const holders = [...this.codeNames].filter(([, code]) => code.toLowerCase() === n).map(([name]) => name)
+    if (holders.length === 0) return n
+    const live = holders.filter(h => this.liveEntry(h) !== undefined && [...this.agents.values()].some(a => bareName(a.name) === h))
+    const pool = live.length > 0 ? live : holders
+    return pool.reduce((best, h) => ((this.startedAt(h) ?? -Infinity) >= (this.startedAt(best) ?? -Infinity) ? h : best))
   }
 
   /** Records an `agent.spawn` once `next` answered with the started agent. */
-  spawned(input: { name?: string; model?: string; subagentType?: string; isTeammate?: boolean; description?: string; workflow?: { runId?: string } },
+  spawned(input: { name?: string; model?: string; subagentType?: string; isTeammate?: boolean; description?: string; workflow?: { runId?: string }; parentAgentId?: string },
           result: { agentId?: string; model?: string; teammateId?: string }, now?: number): RosterEntry | undefined {
     if (!result.agentId) return undefined
     const prior = this.agents.get(result.agentId)
@@ -414,6 +476,7 @@ export class Roster {
       spawnedAt: prior?.spawnedAt ?? now,
       statusAt: prior?.statusAt ?? now,
       workflowRunId: input.workflow?.runId || prior?.workflowRunId,
+      parentId: input.parentAgentId ?? prior?.parentId,
     }
     this.agents.set(entry.id, entry)
     return entry
@@ -421,6 +484,7 @@ export class Roster {
 
   /** Merges `$.agent.list()` rows seen at `now`; returns whether anything changed. */
   merge(rows: readonly AgentRow[], now?: number): boolean {
+    if (now !== undefined) this.seenAt = Math.max(this.seenAt, now)
     let changed = false
     const seen = new Set(rows.map(r => r.id))
     for (const a of this.agents.values()) {
@@ -442,6 +506,7 @@ export class Roster {
         isTeammate: prior?.isTeammate ?? (row.teammateId !== undefined || row.type === 'teammate'),
         teammateId: row.teammateId ?? prior?.teammateId,
         description: prior?.description ?? row.description,
+        parentId: prior?.parentId ?? row.parentId,
         spawnedAt: prior?.spawnedAt,
         firstSeenAt: prior === undefined ? now : prior.firstSeenAt,
         statusAt: prior !== undefined && prior.status === row.status ? prior.statusAt : now,
@@ -531,10 +596,18 @@ export class MessageLog {
   readonly sent = new Map<string, number>()
   readonly received = new Map<string, number>()
   private recentSends: { from: string; to: string; text: string }[] = []
+  /** The texts of this plugin's own sends not yet delivered, by bare recipient name, at most `SEND_MEMORY` each. */
+  private readonly modUndelivered = new Map<string, string[]>()
 
   /** Records one message; returns the entry, or undefined when it is the delivery of a recorded send. */
   record(m: { ts: number; from: string; to: string; text: string; via: Via; fromId?: string; toId?: string }): LogEntry | undefined {
-    if (m.via === 'receive' && this.isEchoOfSend(m.from, m.to, m.text)) return undefined
+    if (m.via === 'receive' && (this.isModDelivery(m.to, m.text) || this.isEchoOfSend(m.from, m.to, m.text))) return undefined
+    if (m.via !== 'receive' && isModName(m.from) && m.text.trim() !== '') {
+      const pending = this.modUndelivered.get(bareName(m.to)) ?? []
+      pending.push(m.text.trim())
+      if (pending.length > SEND_MEMORY) pending.splice(0, pending.length - SEND_MEMORY)
+      this.modUndelivered.set(bareName(m.to), pending)
+    }
     if (m.via !== 'receive') {
       this.recentSends.push({ from: m.from, to: m.to, text: m.text })
       if (this.recentSends.length > SEND_MEMORY) this.recentSends.splice(0, this.recentSends.length - SEND_MEMORY)
@@ -570,6 +643,16 @@ export class MessageLog {
     this.received.set(e.to, (this.received.get(e.to) ?? 0) + 1)
   }
 
+  /** Whether a delivery to `to` carries the text of one of this plugin's own sends to it not yet delivered; that send then counts as delivered. */
+  private isModDelivery(to: string, text: string): boolean {
+    const pending = this.modUndelivered.get(bareName(to))
+    const t = text.trim()
+    const i = t === '' || pending === undefined ? -1 : pending.findIndex(st => t.includes(st) || st.includes(t))
+    if (i < 0) return false
+    pending!.splice(i, 1)
+    return true
+  }
+
   /** Whether a delivery carries a recorded send's text, from the same sender or to the same recipient. */
   private isEchoOfSend(from: string, to: string, text: string): boolean {
     const t = text.trim()
@@ -592,9 +675,9 @@ export function isIdleLine(e: LogEntry): boolean {
   return e.type === 'IDLE'
 }
 
-/** Whether a logged line records a teammate's tool call (`FILE`, `ACT`), not a message. */
+/** Whether a logged line records a tool call (`FILE`, `ACT`, a refused spawn `REFUSED`) or a teammate joining or leaving (`JOIN`, `LEFT`), not a message. */
 export function isToolLine(e: LogEntry): boolean {
-  return e.type === 'FILE' || e.type === 'ACT'
+  return e.type === 'FILE' || e.type === 'ACT' || e.type === 'REFUSED' || e.type === 'JOIN' || e.type === 'LEFT'
 }
 
 const WRITE_TOOLS = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']
@@ -792,12 +875,13 @@ function wakeText(mode: WakeMode, entries: readonly LogEntry[]): string {
 export function nudgeText(minutes: number, claims: readonly Claim[], reports: ReadonlyMap<string, { type: string }>, label: (name: string) => string): string {
   const reported = [...reports].map(([name, r]) => `${label(name)} ${r.type}`)
   const who = reported.length > 0 ? 'reported: ' + reported.join(', ') : 'nobody has reported'
-  return `[ASK] swarm quiet ${minutes} min: you hold ${claims.map(c => c.key).join(', ')}; ${who}. Continue, or send [DONE]/[BLOCK].`
+  return `[ASK] quiet ${minutes} min: you hold ${claims.map(c => c.key).join(', ')}; ${who}. Continue, or send [DONE]/[BLOCK].`
 }
 
-export function stallText(minutes: number, openTasks: number | null): string {
+export function stallText(minutes: number, openTasks: number | null, openClaims = 0): string {
   const tasks = openTasks === null ? 'task list unreadable' : `${openTasks} task(s) still open`
-  return `swarm stalled: no message for ${minutes} min, no agent running, ${tasks}. Check .swarm/roster.json and the task list; reassign, unblock or end the swarm.`
+  const claims = openClaims > 0 ? `, ${openClaims} claim(s) open` : ''
+  return `swarm stalled: no message for ${minutes} min, no agent running, ${tasks}${claims}. Check .swarm/roster.json and the task list; reassign, unblock or end the swarm.`
 }
 
 export type StallInput = {
@@ -807,14 +891,17 @@ export type StallInput = {
   activeAgents: number
   liveAgents: number
   openTasks: number | null
+  /** Open message claims of live teammates: a `[CLAIM]` its holder has not released or reported on since (see `ClaimBoard.report`). */
+  openClaims: number
   leadBusy: boolean
   alreadyFired: boolean
 }
 
-/** Whether the stall watchdog should wake the lead now. */
+/** Whether the stall watchdog should act now: quiet, nobody running, and work remains (an open claim, or open tasks). */
 export function isStalled(s: StallInput): boolean {
   if (s.alreadyFired || s.leadBusy || s.activeAgents > 0) return false
   if (s.now - s.lastActivityAt < s.stallMs) return false
+  if (s.openClaims > 0) return true
   if (s.openTasks !== null) return s.openTasks > 0
   return s.liveAgents > 0
 }
@@ -886,7 +973,8 @@ export type PaneRow = { text: string; dim?: boolean; bold?: boolean }
 
 /**
  * The pane's rows: the header bold; roster rows of active agents, then agents outside the current team or settled for
- * `STALE_MS` dimmed under `── other agents ──`; messages newest first, a previous session's dimmed under `── earlier ──` at the bottom.
+ * `STALE_MS` dimmed under `── other agents ──` and a previous session's agents under `── earlier ──`, each block its newest
+ * `OTHERS_SHOWN` after a `… N more` line; messages newest first, a previous session's dimmed under `── earlier ──` at the bottom.
  */
 export function paneRows(roster: Roster, log: MessageLog, policy: WakePolicy, now: number, cols: number, maxMessages: number, board?: ClaimBoard, stallMs = DEFAULT_STALL_MIN * 60_000): PaneRow[] {
   const w = Math.max(20, cols)
@@ -921,26 +1009,28 @@ export function paneRows(roster: Roster, log: MessageLog, policy: WakePolicy, no
     const since = roster.idleSince(name)
     return stallMs > 0 && since !== undefined && now - since > stallMs && (board?.openClaims(name).length ?? 0) > 0
   }
-  for (const a of agents) if (!others.includes(a)) out.push(row(a.name, shortModel(a.model), hasStalled(a.name) ? 'stalled' : a.status))
+  const shown = agents.filter(a => !others.includes(a))
+  const nested = others.filter(c => c.parentId !== undefined && !roster.isShownEnded(c, now) && shown.some(a => a.id === c.parentId))
+  for (const a of shown) {
+    out.push(row(a.name, shortModel(a.model), hasStalled(a.name) ? 'stalled' : a.status))
+    for (const c of nested) if (c.parentId === a.id) out.push(clip('  └ ' + row(c.name, shortModel(c.model), c.status), w))
+  }
   for (const g of groups) if (!g.isOther) out.push(clip(g.text, w))
-  if (others.length > 0 || groups.some(g => g.isOther)) {
+  const newest = (lines: readonly string[]) => {
+    const more = lines.length - OTHERS_SHOWN
+    for (const l of more > 0 ? [`  … ${more} more`, ...lines.slice(-OTHERS_SHOWN)] : lines) {
+      dim.add(out.length)
+      out.push(l)
+    }
+  }
+  const otherLines = [...groups.filter(g => g.isOther).map(g => clip(g.text, w)), ...others.filter(a => !nested.includes(a)).map(a => row(a.name, shortModel(a.model), a.status))]
+  if (otherLines.length > 0) {
     out.push(OTHER_AGENTS)
-    for (const g of groups) {
-      if (!g.isOther) continue
-      dim.add(out.length)
-      out.push(clip(g.text, w))
-    }
-    for (const a of others) {
-      dim.add(out.length)
-      out.push(row(a.name, shortModel(a.model), a.status))
-    }
+    newest(otherLines)
   }
   if (roster.earlier.length > 0) {
     out.push(EARLIER)
-    for (const a of roster.earlier) {
-      dim.add(out.length)
-      out.push(clip(`  ${nameCell(a.name, false)} ${modelW ? shortModel(a.model).padEnd(modelW) + ' ' : ''}`.trimEnd(), w))
-    }
+    newest(roster.earlier.map(a => clip(`  ${nameCell(a.name, false)} ${modelW ? shortModel(a.model).padEnd(modelW) + ' ' : ''}`.trimEnd(), w)))
   }
   if (board !== undefined) {
     out.push('')
@@ -954,7 +1044,7 @@ export function paneRows(roster: Roster, log: MessageLog, policy: WakePolicy, no
   const current = log.last(maxMessages)
   const earlier = log.earlier.slice(log.earlier.length - Math.max(0, maxMessages - current.length))
   out.push(clip(`MESSAGES  last ${current.length} of ${log.total}${log.earlier.length ? ` · ${log.earlier.length} earlier` : ''}`, w))
-  const line = (e: LogEntry) => clip(`${new Date(e.ts).toTimeString().slice(0, 8)} ${roster.label(e.from)} → ${roster.label(e.to)}: ${e.summary}`, w)
+  const line = (e: LogEntry) => clip(`${timeOfDay(e.ts)} ${roster.label(e.from)} → ${roster.label(e.to)}: ${e.summary}`, w)
   if (current.length === 0 && earlier.length === 0) out.push('(none yet)')
   for (const e of [...current].reverse()) out.push(line(e))
   if (earlier.length > 0) {
@@ -979,37 +1069,124 @@ export type ClaimRef = { role: string; target: string }
 export type Claim = ClaimRef & { key: string; by: string[] }
 export type TaskRow = { subject: string; owner?: string; status: string }
 
-/** Role and target of a claim subject: `build var/gaps.md` → { role: 'build', target: 'var/gaps.md' }. */
+/** Whether a word names a file or a path: it holds a `/` or ends in a file extension. */
+function isPathLike(word: string): boolean {
+  return word.includes('/') || /\.[a-z][a-z0-9]{0,7}$/.test(word)
+}
+
+/**
+ * Role and target of a claim subject: `build var/gaps.md` → { role: 'build', target: 'var/gaps.md' }. A target that starts
+ * with a path or file name is that path alone: `research docs/05-x.md (h14). output: …` → `docs/05-x.md`.
+ */
 function parseClaimSubject(subject: string): ClaimRef {
   const words = subject.trim().replace(/\s+/g, ' ').split(' ')
   const head = (words[0] ?? '').toLowerCase().replace(/[:,]$/, '')
   const role = ROLE_WORDS[head]
   const rest = (role === undefined ? words : words.slice(1)).join(' ')
   const target = rest.toLowerCase().replace(/^(of|the|for)\s+/, '').replace(/[`"'„“”]/g, '').replace(/[.,;:!]+$/, '').trim()
-  return { role: role ?? 'other', target }
+  const path = /^[^\s,;()]+/.exec(target)?.[0]?.replace(/[.:!]+$/, '')
+  return { role: role ?? 'other', target: path !== undefined && isPathLike(path) ? path : target }
 }
 
 /**
  * Whether a claim subject is a sentence fragment, not a target. Judged on its target token, the first word after the role
- * word, or the inside of a quoted or bracketed start: a fragment when that is empty, holds a space or a `"`, or says `please`.
+ * word, or the inside of a quoted or bracketed start: a fragment when that is empty, holds a `"`, says `please`, or holds a
+ * space outside quotes (`"group A"` and `` `group A` `` name one slice of several words).
  */
 function isFragment(subject: string): boolean {
   const rest = subject.trim().replace(/^(\S+)\s*/, (w, head: string) => (ROLE_WORDS[head.toLowerCase().replace(/[:,]$/, '')] === undefined ? w : ''))
   const wrapped = /^(?:"([^"]*)"|`([^`]*)`|\(([^)]*)\))/.exec(rest)
   const token = wrapped === null ? (rest.split(/\s/)[0] ?? '') : (wrapped[1] ?? wrapped[2] ?? wrapped[3] ?? '').trim()
-  return token === '' || /[\s"]/.test(token) || /please/i.test(token)
+  const isQuoted = wrapped !== null && wrapped[3] === undefined
+  return token === '' || token.includes('"') || (/\s/.test(token) && !isQuoted) || /please/i.test(token)
 }
 
 /**
- * The claim a message makes: `[CLAIM] <role> <artefact or slice>` on its first line, else the rest of the first line that
- * carries `[CLAIM]` anywhere (`Slice wanted: [CLAIM] build #158 (…)` inside a hello); none when the subject is a fragment
- * or its first word is no role (`build`, `review`, `research`).
+ * The rest of the line after the first `[CLAIM]` that is a claim's own tag: any one not inside quotes or backticks and not
+ * right after a possessive (`v18's [CLAIM] …`) or after my, your, his, her, their, its, the, a, own, confirm, quote(d),
+ * send, sends or sent, which quote or report another claim.
+ */
+function claimSubjectOf(text: string): string | undefined {
+  for (const line of unstamped(text).split('\n')) {
+    for (const m of line.matchAll(/\[CLAIM\]/gi)) {
+      const before = line.slice(0, m.index)
+      if (((before.match(/["`“”]/g)?.length ?? 0) % 2) === 1) continue
+      if (/(?:['’]s|\b(?:my|your|his|her|their|its|the|a|own|confirm|quote|quoted|send|sends|sent))\s*$/i.test(before)) continue
+      return line.slice(m.index + m[0].length).trim()
+    }
+  }
+  return undefined
+}
+
+/**
+ * The target token of a claim subject after its role word, lower-cased: the first word, or the inside of a quoted or
+ * bracketed start, after a leading `of`, `the` or `for`; cut at a `,`, `;`, `(` or `|` and without quotes, a leading `*` or trailing `.:!)*`.
+ * `research core-aa (u1, sonnet)` → `core-aa`, `build #155 (hydration fix)` → `#155`, `build (docs/x.md)` → `docs/x.md`.
+ */
+function claimTarget(rest: string): string {
+  const r = rest.trim().replace(/^(?:of|the|for)\s+/i, '')
+  const wrapped = /^(?:"([^"]*)"|`([^`]*)`|\(([^)]*)\))/.exec(r)
+  const token = wrapped === null ? (r.split(/\s/)[0] ?? '') : (wrapped[1] ?? wrapped[2] ?? wrapped[3] ?? '').trim()
+  return (token.toLowerCase().replace(/[`"'„“”]/g, '').replace(/^\*+/, '').split(/[,;(|]/)[0] ?? '').replace(/[.:!)*]+$/, '')
+}
+
+/**
+ * The claim a message makes: `[CLAIM] <role> <target>` on its first line, else after the first `[CLAIM]` anywhere in it
+ * (`Slice wanted: [CLAIM] build #158 (…)` inside a hello); the target is its target token (see `claimTarget`), never the
+ * words after it. None when the subject is a fragment or its first word is no role (`build`, `review`, `research`), none
+ * for a first line `[CLAIM] <target> is withdrawn|is released …`, which releases it, and none for a first line that reports
+ * who holds it (`[CLAIM] <target> is already taken: …`, `… claimed by w2`; see `isClaimReport`).
  */
 export function claimOf(text: string): ClaimRef | undefined {
-  const subject = CLAIM_TAG.exec(firstLine(text, 400))?.[1] ?? /\[CLAIM\]\s*([^\n]*)/i.exec(text)?.[1]
+  if (isClaimReport(firstLine(text, 400))) return undefined
+  const subject = CLAIM_TAG.exec(firstLine(text, 400))?.[1] ?? claimSubjectOf(text)
   if (subject === undefined || isFragment(subject)) return undefined
-  const ref = parseClaimSubject(subject)
-  return ref.role === 'other' ? undefined : ref
+  const words = subject.trim().split(/\s+/)
+  const role = ROLE_WORDS[(words[0] ?? '').toLowerCase().replace(/[:,]$/, '')]
+  if (role === undefined) return undefined
+  const target = claimTarget(subject.trim().slice((words[0] ?? '').length))
+  return target === '' ? undefined : { role, target }
+}
+
+const RELEASE_TAG = /^(?:<[^>]*>\s*)?\[(?:RELEASE|WITHDRAW)\]\s*(.+)$/i
+const RELEASED = String.raw`(?!(?:the|my|a|an|it|this|that)\b)((?:(?:build|review|research)\s+)?[^\s,;:()]+)`
+const RELEASE_SAID = new RegExp(String.raw`^(?:<[^>]*>\s*)?(?:\[[A-Za-z]+\]\s*)?(?:[\w-]+:\s*)?(?:I\s+(?:release|withdraw|drop\s+my\s+claim\s+on)\s+${RELEASED}|I\s+drop\s+my\s+${RELEASED}\s+claim\b|Yield(?:ing)?\s+${RELEASED}\s+to\s)`, 'i')
+const CLAIM_RELEASED = new RegExp(String.raw`^(?:<[^>]*>\s*)?\[CLAIM\]\s*${RELEASED}\s+is\s+(?:withdrawn|released)\b`, 'i')
+const CLAIM_REPORTED = new RegExp(String.raw`^(?:<[^>]*>\s*)?\[CLAIM\]\s*${RELEASED}\s+(?:is\s+(?:already\s+)?(?:taken|held)\b|is\s+already\s+claimed\b|(?:is\s+)?(?:already\s+)?(?:claimed|held|taken)\s+by\b)`, 'i')
+
+/**
+ * Whether a first line is `[CLAIM] <target> is withdrawn|released …`, or reports a holder: `[CLAIM] <target> is (already)
+ * taken|held`, `is already claimed`, or `(is) claimed|held|taken by …`. No claim.
+ */
+function isClaimReport(line: string): boolean {
+  return CLAIM_RELEASED.test(line) || CLAIM_REPORTED.test(line)
+}
+const RELEASED_TO = new RegExp(String.raw`^(?:the\s+)?${RELEASED}\s+claim\s+is\s+released\s+to\s`, 'i')
+
+/**
+ * What a message gives up, or undefined: the target after a first-line `[RELEASE] <target>` or `[WITHDRAW] <target>`; the
+ * one word (after an optional role word) of a first clause, after an optional `<name>:`, `I release|withdraw|drop my claim
+ * on <target>`, `I drop my <target> claim` or `Yielding <target> to …`; or of a first-line sentence `The <target> claim is
+ * released to …`; or of a first line `[CLAIM] <target> is withdrawn|is released …`, which is no claim. A word that is `the`, `my`, `a`, `an`, `it`, `this` or `that` names no target. Nothing else is a release.
+ */
+export function releaseOf(text: string): string | undefined {
+  const line = firstLine(text, 400)
+  const said = RELEASE_SAID.exec(line.split(/\.\s|;|\s[—–-]\s/)[0] ?? '')
+  const target = RELEASE_TAG.exec(line)?.[1] ?? CLAIM_RELEASED.exec(line)?.[1] ?? said?.slice(1).find(g => g !== undefined) ?? line.split(/\.\s|;\s*/).map(s => RELEASED_TO.exec(s.trim())?.[1]).find(g => g !== undefined)
+  return target === undefined || target.trim() === '' ? undefined : target.trim()
+}
+
+/**
+ * Whether a text names a claim target: its first word, that word's file name, the file name without its extension, or the
+ * file name's leading number (`03` for `docs/03-accounts.md`), each as a whole word.
+ */
+export function mentionsTarget(text: string, target: string): boolean {
+  const t = text.toLowerCase()
+  const head = (target.toLowerCase().split(/[\s(,;]/)[0] ?? '').replace(/[.:!]+$/, '')
+  const base = baseName(head)
+  const words = [head, base, base.replace(/\.[a-z][a-z0-9]{0,7}$/, ''), /^(\d+)-/.exec(base)?.[1] ?? ''].filter(w => w.length >= 2)
+  const esc = (w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return words.some(w => new RegExp(`(^|[^\\w-])${esc(w)}($|[^\\w-])`).test(t))
 }
 
 /** The `Deliverable: <path>` lines of a brief; several split on `,` or `;`. */
@@ -1087,6 +1264,8 @@ export function parseTasks(files: readonly string[]): TaskRow[] {
 export class ClaimBoard {
   private readonly fromMessages = new Map<string, Claim>()
   private fromTasks = new Map<string, Claim>()
+  /** The task-list claims of tasks not completed. */
+  private openTasks = new Map<string, Claim>()
   unclaimedTasks: string[] = []
   deliverables: string[] = []
 
@@ -1100,6 +1279,10 @@ export class ClaimBoard {
   private readonly since = new Map<string, Map<string, { stamp?: number; at?: number }>>()
   /** Each teammate's latest `[DONE]`, `[REVIEW]` or `[BLOCK]`: its type and the running count when sent. */
   readonly reports = new Map<string, { type: string; at: number }>()
+  /** The running count at which each claimant last reported on each claim (see `report`), by `key` then claimant. */
+  private readonly closed = new Map<string, Map<string, number>>()
+  /** The later claimants of each claim, by `key`: those whose build or research claim found a holder (see `heldBefore`), or whose review claim found a live reviewer. */
+  private readonly later = new Map<string, Set<string>>()
   private sent = 0
 
   private static put(map: Map<string, Claim>, by: string, ref: ClaimRef): boolean {
@@ -1142,7 +1325,7 @@ export class ClaimBoard {
   }
 
   /** The claim already on the board with the same role and a target `sameTarget` matches, else `ref` itself. */
-  private canonical(ref: ClaimRef): ClaimRef {
+  canonical(ref: ClaimRef): ClaimRef {
     if (this.fromMessages.has(ref.role + ' ' + ref.target)) return ref
     const c = [...this.fromMessages.values()].find(x => x.role === ref.role && sameTarget(x.target, ref.target))
     return c === undefined ? ref : { role: c.role, target: c.target }
@@ -1150,7 +1333,9 @@ export class ClaimBoard {
 
   /**
    * Records a claim message under the claim with the same role and a matching target, if any; `isSend` false (a delivery
-   * seen later) leaves its order as sent; `at` is its order stamp and time. Returns whether it was new.
+   * seen later) leaves its order as sent; `at` is its order stamp and time, renewed when `by` no longer held it. A build or research claim that finds a holder, or a
+   * review claim on a slice a live teammate already reviews, is a later claim; the sender's later claims on other slices lapse
+   * (see `isActive`). Returns whether it was new.
    */
   claim(by: string, given: ClaimRef, isSend = true, at: { stamp?: number; at?: number } = {}): boolean {
     const ref = this.canonical(given)
@@ -1159,25 +1344,48 @@ export class ClaimBoard {
     const since = this.since.get(key) ?? new Map<string, { stamp?: number; at?: number }>()
     this.since.set(key, since)
     const prior = since.get(name)
-    if (prior === undefined || (prior.stamp === undefined && prior.at === undefined)) since.set(name, at)
+    const held = this.fromMessages.get(key)
+    const holds = held !== undefined && held.by.includes(name) && this.isActive(held, name)
+    if (prior === undefined || (prior.stamp === undefined && prior.at === undefined) || (isSend && !holds)) since.set(name, at)
     const sent = this.lastSent.get(key) ?? new Map<string, number>()
     this.lastSent.set(key, sent)
     if (isSend || !sent.has(name)) sent.set(name, ++this.sent)
+    const later = this.later.get(key) ?? new Set<string>()
+    this.later.set(key, later)
+    const isLater = ref.role === 'review' ? held !== undefined && held.by.some(n => n !== name && this.isActive(held, n)) : this.heldBefore(by, ref) !== undefined
+    if (isLater) later.add(name)
+    else later.delete(name)
+    this.close(name, this.sent, c => c.key !== key && this.later.get(c.key)?.has(name) === true)
     return ClaimBoard.put(this.fromMessages, name, ref)
   }
 
+  /** Closes, at count `at`, each message claim of `name` that `which` picks. */
+  private close(name: string, at: number, which: (c: Claim) => boolean) {
+    for (const c of this.fromMessages.values()) {
+      if (!c.by.includes(name) || !which(c)) continue
+      const closed = this.closed.get(c.key) ?? new Map<string, number>()
+      this.closed.set(c.key, closed)
+      closed.set(name, at)
+    }
+  }
+
   /**
-   * Who held a build or research claim before `by` claimed the same target: of the claimants that still hold it (see
+   * Who held a build or research claim before `by` claimed the same target: a live owner of a task on that target not completed, of the
+   * same role or with no role word, unless `by` owns one too; else, of the claimants by message that still hold it (see
    * `isActive`), the one with the lowest order stamp, or the first to claim when any claim has none; with when and as which
-   * stamp. Undefined when `by` came first or nobody else still holds it.
+   * stamp. Undefined when `by` owns such a task, came first, or nobody else still holds it.
    */
   heldBefore(by: string, given: ClaimRef): { key: string; target: string; holder: string; stamp?: number; at?: number } | undefined {
     if (given.role !== 'build' && given.role !== 'research') return undefined
     const ref = this.canonical(given)
     const key = ref.role + ' ' + ref.target
+    const name = bareName(by)
+    const tasks = [...this.openTasks.values()].filter(c => (c.role === ref.role || c.role === 'other') && sameTarget(c.target, ref.target))
+    if (tasks.some(c => c.by.includes(name))) return undefined
+    const owner = tasks.flatMap(c => c.by).find(n => this.isLive(n))
+    if (owner !== undefined) return { key, target: ref.target, holder: owner }
     const claim = this.fromMessages.get(key)
     if (claim === undefined) return undefined
-    const name = bareName(by)
     const since = this.since.get(key)
     const rivals = claim.by.filter(n => n === name || this.isActive(claim, n))
     const stamps = rivals.map(n => since?.get(n)?.stamp)
@@ -1187,44 +1395,115 @@ export class ClaimBoard {
   }
 
   /**
-   * Whether `name` still holds claim `c`: it is live and, for a message claim, has not sent a `[DONE]` or `[REVIEW]` as its
-   * latest report after the claim.
+   * Whether `name` still holds claim `c`: it is live and, for a message claim, has not reported on it since it last claimed it;
+   * a later claim (one that found a holder) also lapses at its sender's next report or claim of another slice.
    */
   isActive(c: Claim, name: string): boolean {
     if (!this.isLive(name)) return false
-    const report = this.reports.get(name)
-    if (!this.fromMessages.get(c.key)?.by.includes(name) || report === undefined || report.type === 'BLOCK') return true
-    return this.sentAt(c.key, name) > report.at
+    if (!this.fromMessages.get(c.key)?.by.includes(name)) return true
+    return this.sentAt(c.key, name) > (this.closed.get(c.key)?.get(name) ?? 0)
   }
 
-  /** Records a `[DONE]`, `[REVIEW]` or `[BLOCK]` from `by`; `isSend` false (a delivery seen later) keeps an earlier one. Returns whether it changed. */
-  report(by: string, type: string, isSend = true): boolean {
+  /**
+   * Records a `[DONE]`, `[REVIEW]` or `[BLOCK]` from `by` and closes its claims per slice: a `[DONE]` closes the claims of `by`
+   * on the slices its first line names, a `[REVIEW]` the review claims of `by` on them; one naming no slice on the board closes
+   * every claim of `by` (a `[DONE]`) or every review claim of `by` (a `[REVIEW]`); a `[BLOCK]` closes none. Every report closes
+   * the later claims of `by`. Nothing else closes, so the other claims of `by` stay open. `isSend` false (a delivery seen later)
+   * keeps an earlier report. Returns whether it changed.
+   */
+  report(by: string, type: string, isSend = true, text = ''): boolean {
     const name = bareName(by)
     if (!isSend && this.reports.has(name)) return false
-    this.reports.set(name, { type, at: ++this.sent })
+    const at = ++this.sent
+    this.reports.set(name, { type, at })
+    const isLater = (c: Claim) => this.later.get(c.key)?.has(name) === true
+    if (type === 'BLOCK') {
+      this.close(name, at, isLater)
+      return true
+    }
+    const subject = firstLine(text, 400).replace(/^(?:<[^>]*>\s*)?\[[A-Za-z]+\]\s*/, '')
+    const named = [...this.fromMessages.values()].filter(c => mentionsTarget(subject, c.target))
+    const pool = [...this.fromMessages.values()].filter(c => c.by.includes(name) && (type === 'DONE' || c.role === 'review'))
+    const closing = named.length > 0 ? pool.filter(c => named.includes(c)) : pool
+    this.close(name, at, c => closing.includes(c) || isLater(c))
     return true
   }
 
-  /** The message claims `by` sent after its latest report. */
+  /**
+   * Takes `by` off its own message claims a release names (see `releaseOf`): each one whose target its text names before its
+   * first sentence end or `[CLAIM]` (`[RELEASE] web-ab, web-ac`, `[WITHDRAW] h10 withdraws the 06-web-app claim`), of its role
+   * when it starts with a role word (`[WITHDRAW] build docs/a.md`); a `[CLAIM]` of another slice on the same line releases
+   * nothing. Returns whether any changed.
+   */
+  release(by: string, text: string): boolean {
+    return this.releasing(by, text).length > 0
+  }
+
+  /** Does what `release` does; returns the claims `by` was taken off. */
+  releasing(by: string, text: string): Claim[] {
+    const what = releaseOf(text)
+    if (what === undefined) return []
+    const name = bareName(by)
+    const head = what.trim().split(/\s+/)[0] ?? ''
+    const role = ROLE_WORDS[head.toLowerCase().replace(/[:,]$/, '')]
+    const named = (what.split(/\[CLAIM\]/i)[0] ?? '').split(/[.!?](?:\s|$)/)[0] ?? ''
+    const gone = [...this.fromMessages.values()].filter(c => c.by.includes(name) && (role === undefined || role === c.role) && mentionsTarget(named, c.target))
+    for (const c of gone) {
+      c.by.splice(c.by.indexOf(name), 1)
+      this.since.get(c.key)?.delete(name)
+      this.lastSent.get(c.key)?.delete(name)
+      if (c.by.length === 0) this.fromMessages.delete(c.key)
+    }
+    return gone
+  }
+
+  /**
+   * The claimant who holds `c` first now that its holder released it: the active claimant `heldBefore` finds no holder for,
+   * which no longer counts as a later claimant; undefined when nobody still holds it.
+   */
+  handOff(c: Claim): string | undefined {
+    const next = this.fromMessages.get(c.key)?.by.find(n => this.isActive(c, n) && this.heldBefore(n, c) === undefined)
+    if (next !== undefined) this.later.get(c.key)?.delete(next)
+    return next
+  }
+
+  /** The message claims a release from `by` names (see `releasing`) that another teammate still holds and `by` does not. */
+  heldByOthers(by: string, text: string): Claim[] {
+    const what = releaseOf(text)
+    if (what === undefined) return []
+    const name = bareName(by)
+    const named = (what.split(/\[CLAIM\]/i)[0] ?? '').split(/[.!?](?:\s|$)/)[0] ?? ''
+    return [...this.fromMessages.values()].filter(c => !c.by.includes(name) && c.by.some(n => this.isActive(c, n)) && mentionsTarget(named, c.target))
+  }
+
+  /** Deliverables no build or research claim names, then unowned tasks: the slices a later claimant could take instead. */
+  unclaimed(): string[] {
+    const held = this.all().filter(c => c.role === 'build' || c.role === 'research')
+    return [...this.deliverables.filter(d => !held.some(c => targetMatches(c.target, d))), ...this.unclaimedTasks]
+  }
+
+  /** The message claims `by` still holds (see `isActive`). */
   openClaims(by: string): Claim[] {
     const name = bareName(by)
-    const reported = this.reports.get(name)?.at ?? 0
-    return [...this.fromMessages.values()].filter(c => c.by.includes(name) && this.sentAt(c.key, name) > reported)
+    return [...this.fromMessages.values()].filter(c => c.by.includes(name) && this.isActive(c, name))
   }
 
   /** Replaces the task-list claims: an owned task claims its subject for its owner; an owner `resolve` maps to undefined claims nothing. */
   setTasks(tasks: readonly TaskRow[], resolve: (owner: string) => string | undefined) {
     const next = new Map<string, Claim>()
+    const open = new Map<string, Claim>()
     const unclaimed: string[] = []
     for (const t of tasks) {
       if (t.status === 'deleted') continue
       if (t.owner !== undefined) {
         const owner = resolve(t.owner)
         if (owner !== undefined) ClaimBoard.put(next, owner, parseClaimSubject(t.subject))
+        if (owner !== undefined && t.status !== 'completed') ClaimBoard.put(open, owner, parseClaimSubject(t.subject))
       }
       else if (t.status !== 'completed' && t.subject !== '') unclaimed.push(t.subject)
     }
     this.fromTasks = next
+    this.openTasks = open
     this.unclaimedTasks = unclaimed
   }
 
@@ -1240,6 +1519,8 @@ export class ClaimBoard {
     this.lastSent.clear()
     this.since.clear()
     this.reports.clear()
+    this.closed.clear()
+    this.later.clear()
     this.sent = 0
     this.deliverables = []
   }
@@ -1285,10 +1566,9 @@ export class ClaimBoard {
     return [...bySlice.values()].filter(c => c.by.length > 1)
   }
 
-  /** Deliverables no build claim names; with none known, `the deliverable` while no build claim exists at all. */
+  /** Deliverables no build claim names; none while no deliverable is known. */
   missingBuilders(): string[] {
     const builds = this.all().filter(c => c.role === 'build')
-    if (this.deliverables.length === 0) return builds.length === 0 ? ['the deliverable'] : []
     return this.deliverables.filter(d => !builds.some(c => targetMatches(c.target, d)))
   }
 }
@@ -1320,17 +1600,29 @@ export function claimAlerts(i: ClaimWatchInput): { key: string; text: string }[]
   return out
 }
 
-/** Replays this session's logged `[CLAIM]`, `[DONE]`, `[REVIEW]` and `[BLOCK]` lines from teammates, sent at `since` or later, onto the board; returns whether any was new. */
+/**
+ * The claim a logged line made: its `claim` field, else for a line logged without one the claim its first line makes; none
+ * when its first line releases or reports a claim (see `claimOf`), though an older log stored one.
+ */
+export function claimOfLine(e: LogEntry): ClaimRef | undefined {
+  if (isClaimReport(e.summary)) return undefined
+  const c = e.claim
+  if (c !== undefined && typeof c.role === 'string' && typeof c.target === 'string') return { role: c.role, target: c.target }
+  return claimOf(e.summary)
+}
+
+/** Replays this session's logged `[CLAIM]`, releases, `[DONE]`, `[REVIEW]` and `[BLOCK]` lines from teammates, sent at `since` or later, onto the board; returns whether any was new. */
 export function hydrateClaims(board: ClaimBoard, lines: readonly LogEntry[], session: string, since = -Infinity): boolean {
   let changed = false
   for (const e of lines) {
     if (e.session !== session || e.ts < since || isLeadAddress(e.from) || isModName(e.from) || isIdleLine(e) || isToolLine(e)) continue
-    const ref = claimOf(e.summary)
+    const ref = claimOfLine(e)
     if (ref !== undefined && board.claim(e.from, ref, e.via !== 'receive', { stamp: e.stamp, at: e.ts })) changed = true
+    if (board.release(e.from, e.summary)) changed = true
     const verdict = reviewOf(e.summary)
     if (verdict !== undefined && board.review(e.from, verdict)) changed = true
     const type = typeOf(e.summary)
-    if (type !== undefined && REPORTS.includes(type) && board.report(e.from, type, e.via !== 'receive')) changed = true
+    if (type !== undefined && REPORTS.includes(type) && board.report(e.from, type, e.via !== 'receive', e.summary)) changed = true
   }
   return changed
 }
@@ -1364,9 +1656,12 @@ export function reviewOf(text: string): { slice: string; state: ReviewState } | 
   return /\bapprov(?:e|ed|es)\b/i.test(rest) ? { slice: issue, state: 'approve' } : undefined
 }
 
-export function claimWakeText(alerts: readonly { text: string }[]): string {
-  return [...alerts.map(a => a.text),
-    'Assign the builder now: set the task owner and tell the assignee to send [CLAIM] build <artefact>. Claims: /swarm pane, .swarm/roster.json.'].join('\n')
+/** The claim watchdog's wake: its alerts, then what to do; the builder line only when the swarm has deliverables. */
+export function claimWakeText(alerts: readonly { text: string }[], hasDeliverables = true): string {
+  const act = hasDeliverables
+    ? 'Assign the builder now: set the task owner and tell the assignee to send [CLAIM] build <artefact>.'
+    : 'Ask them to claim a slice with [CLAIM] <role> <slice>, or set a task owner.'
+  return [...alerts.map(a => a.text), act + ' Claims: /swarm pane, .swarm/roster.json.'].join('\n')
 }
 
 const SLICE_ROLES = ['build', 'review', 'research'] as const

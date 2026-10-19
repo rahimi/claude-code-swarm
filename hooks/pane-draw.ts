@@ -3,7 +3,7 @@
 
 import { lookA } from './look-a'
 import { lookB } from './look-b'
-import { agentColor } from './looks'
+import { agentColor, width } from './looks'
 import type { Frame, ImageLayer, LookFn } from './looks'
 import { FLIGHT } from './look-a'
 import { NEBULA } from './look-b'
@@ -17,12 +17,12 @@ const PALETTES = { A: FLIGHT, B: NEBULA }
 /** One button of the control row: an agent to filter by, or an action; a `hidden` one is only its hotkey. */
 export type Control = { key: string; label: string; color?: string; dim?: boolean; plain?: boolean; hotkey?: string; hidden?: boolean }
 
-/** One button per agent, in its colour; pressed, it filters to that agent's threads. */
+/** One button per agent, in its colour, `⚠` after a code name another agent also took; pressed, it filters to that agent's threads. */
 export function agentControls(scene: Scene, filter: string | undefined, look: Look): Control[] {
   const p = PALETTES[look]
   return scene.order().map(a => ({
     key: 'agent-' + a.name,
-    label: a.code ?? a.name,
+    label: (a.code ?? a.name) + (scene.isDuplicateCode(a.name) ? ' ⚠' : ''),
     color: css(agentColor(p, a)),
     dim: filter !== undefined && filter !== a.name,
     plain: true,
@@ -38,6 +38,14 @@ export function viewControls(shown: Look | 'list', withList: boolean): Control[]
   ]
 }
 
+/** The key of the live pane's `[ stop all ]` button. */
+export const STOP_ALL_KEY = 'stop-all'
+
+/** The live pane's `[ stop all ]` (`x`), while any teammate is live: it asks, then stops every live teammate. */
+export function stopControls(hasLive: boolean): Control[] {
+  return hasLive ? [{ key: STOP_ALL_KEY, label: 'stop all', hotkey: 'x' }] : []
+}
+
 /** The replay's control row: `[ live ]` while a live swarm waits, each agent, the views, then nudge, pause and stop. */
 export function controlsOf(scene: Scene, filter: string | undefined, look: Look, isPaused = false, liveWaiting = false): Control[] {
   return [
@@ -48,6 +56,21 @@ export function controlsOf(scene: Scene, filter: string | undefined, look: Look,
     { key: 'pause', label: isPaused ? 'play' : 'pause', hotkey: 'p' },
     { key: 'stop', label: 'stop', hotkey: 's' },
   ]
+}
+
+/** How many rows the control row takes at `cols` columns once it wraps: a plain button is its label, another `[ label ]`, two columns apart. */
+export function controlRows(controls: readonly Control[], cols: number): number {
+  let rows = 1
+  let x = 0
+  for (const c of controls) {
+    if (c.hidden === true) continue
+    const w = width(c.label) + (c.plain === true ? 0 : 4)
+    if (x > 0 && x + 2 + w > cols) {
+      rows++
+      x = w
+    } else x += (x > 0 ? 2 : 0) + w
+  }
+  return rows
 }
 
 /** A horizontal band of the stage: rows [y, y + rows), cut at its images' columns into raster and image pieces. */
@@ -98,17 +121,16 @@ export function shapeOf(bands: readonly Band[]): string {
 /** The least real time between two sources of one Image: a change sooner waits, and changes in between merge into it. */
 export const IMAGE_MIN_MS = 1_000
 
-/** The source each Image key shows, its sig and when it was made; a new one waits the shorter of the kept and the new layer's `minMs`. */
+/** The source each Image key shows, its sig and when it was made; a new one waits `IMAGE_MIN_MS` after the kept one. */
 export class ImageShelf {
-  private readonly held = new Map<string, { sig: string; source: ImageSource; at: number; minMs: number }>()
+  private readonly held = new Map<string, { sig: string; source: ImageSource; at: number }>()
 
   /** The source to show for the layer at real time `now`, and whether it is a new one to send. */
   take(layer: ImageLayer, now: number): { source: ImageSource; isNew: boolean } {
     const kept = this.held.get(layer.key)
-    const minMs = layer.minMs ?? IMAGE_MIN_MS
-    if (kept !== undefined && (kept.sig === layer.sig || now - kept.at < Math.min(minMs, kept.minMs))) return { source: kept.source, isNew: false }
-    const source = layer.source?.() ?? layer.draw().source()
-    this.held.set(layer.key, { sig: layer.sig, source, at: now, minMs })
+    if (kept !== undefined && (kept.sig === layer.sig || now - kept.at < IMAGE_MIN_MS)) return { source: kept.source, isNew: false }
+    const source = layer.draw().source()
+    this.held.set(layer.key, { sig: layer.sig, source, at: now })
     return { source, isNew: true }
   }
 
